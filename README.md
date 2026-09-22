@@ -6,7 +6,10 @@ eligibility-aware jobs, applications and offers, campus drives, reports, and bro
 The domain model mirrors `placementhub/lib/data.ts`; every export there has an endpoint here.
 See [openapi.yaml](openapi.yaml) for the full API and [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the design decisions.
 
-## Quick start
+Live stack: **[Vercel](https://vercel.com)** (frontend) → **this API on [Render](https://render.com)** → **[Neon](https://neon.tech)** (Postgres).
+Frontend repo: [placementhub-frontend](https://github.com/noobdivya/placementhub-frontend).
+
+## Quick start (local)
 
 ```bash
 docker compose up -d db          # Postgres on localhost:5433
@@ -99,10 +102,119 @@ Queries are plain `pgx` with SQL in the services (the plan mentioned `sqlc`; han
 
 ## Configuration
 
-See [.env.example](.env.example). Key variables: `DATABASE_URL`, `JWT_SECRET`, `CORS_ALLOWED_ORIGINS`, `COOKIE_SECURE`,
-`VAPID_*`, `BOOTSTRAP_ADMIN_*` (creates the first admin when none exists), `APP_TIMEZONE`, `OFFER_VALIDITY_DAYS`, `UPLOAD_DIR`.
+See [.env.example](.env.example) for the full list with comments. Summary:
 
-## Deploying
+| Variable | Required | Notes |
+|---|---|---|
+| `APP_ENV` | prod: `production` | enables production validation (`COOKIE_SECURE`, no dev `JWT_SECRET`) |
+| `HTTP_ADDR` | no | default `:8080`; Render sets `PORT` — see below |
+| `DATABASE_URL` | yes | `postgres://user:pass@host/db?sslmode=require` (Neon) |
+| `JWT_SECRET` | yes | ≥ 32 random bytes — `openssl rand -base64 48` |
+| `ACCESS_TOKEN_TTL`, `REFRESH_TOKEN_TTL` | no | defaults `15m`, `336h` |
+| `FRONTEND_URL` | yes | the deployed frontend origin, e.g. `https://placementhub.vercel.app` |
+| `CORS_ALLOWED_ORIGINS` | yes | comma-separated allow-list; must include every frontend origin that calls the API (prod + Vercel preview URLs if you use them) |
+| `COOKIE_SECURE` | prod: `true` | must be `true` behind HTTPS |
+| `COOKIE_SAMESITE` | cross-domain: `none` | **`none` on Render+Vercel** — frontend and backend are different domains, see below |
+| `TRUSTED_PROXY` | prod: `true` | Render sits behind a proxy that sets `X-Forwarded-For` |
+| `BOOTSTRAP_ADMIN_EMAIL/PASSWORD/NAME` | first deploy | creates the first admin account if none exists yet; safe to unset after |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | no | generate with `go run ./cmd/vapid`; omit to disable push |
+| `APP_TIMEZONE` | no | default `Asia/Kolkata` |
+| `OFFER_VALIDITY_DAYS` | no | default `7` |
+| `UPLOAD_DIR`, `MAX_UPLOAD_MB` | no | default `./uploads`, `5` — see disk note below |
+| `RUN_WORKERS` | no | default `true`; set `false` on extra replicas so only one runs the push worker + scheduler |
+
+## Deployment
+
+### Overview
+
+```
+Neon (Postgres)  <──DATABASE_URL──  Render (this API, Docker)  <──NEXT_PUBLIC_API_URL──  Vercel (frontend)
+```
+
+Deploy in this order so each step has the value it needs from the previous one:
+
+1. **Neon** — create the database, copy the connection string.
+2. **Render** — deploy this repo with that connection string.
+3. **[Vercel](https://github.com/noobdivya/placementhub-frontend#deployment)** — deploy the frontend pointed at the Render URL.
+4. Come back to Render and set `CORS_ALLOWED_ORIGINS`/`FRONTEND_URL` to the final Vercel URL, then redeploy.
+
+### 1. Database — Neon
+
+1. Sign in at [neon.tech](https://neon.tech) and **New Project** (any region close to your Render region).
+2. On the project dashboard, open **Connection Details** and copy the **pooled** connection string
+   (host contains `-pooler`; the API uses a connection pool itself, and Render's free tier especially benefits from Neon's pooler).
+3. It looks like:
+   ```
+   postgresql://<user>:<password>@ep-xxxx-pooler.<region>.aws.neon.tech/<dbname>?sslmode=require&channel_binding=require
+   ```
+   **Drop `&channel_binding=require`** — `pgx` (this API's driver) doesn't recognise that parameter and the connection
+   will fail to establish. Keep `sslmode=require`. Also change the scheme from `postgresql://` to `postgres://`
+   (both work with `psql`, but use `postgres://` here to match `.env.example`). Result:
+   ```
+   postgres://<user>:<password>@ep-xxxx-pooler.<region>.aws.neon.tech/<dbname>?sslmode=require
+   ```
+4. That's it — no manual migration step. The API runs `goose` migrations automatically against this URL on every startup (`internal/db.Migrate`, called from `cmd/api`).
+5. Neon's free tier suspends an idle database and wakes it on the next connection (a few hundred ms of extra latency on the first request after idling) — expected, not an error.
+
+### 2. API — Render
+
+1. Sign in at [render.com](https://render.com) → **New +** → **Web Service** → connect the `placementhub-backend` GitHub repo.
+2. **Language/Runtime: Docker.** Render detects the repo's `Dockerfile` automatically — leave build/start commands blank.
+3. **Region:** pick one close to your Neon region. **Instance type:** the free tier works for evaluation; note its cold starts and ephemeral disk (below).
+4. **Health check path:** `/healthz` (already implemented and used by the Dockerfile's own `HEALTHCHECK`).
+5. **Environment variables** — add these under the service's *Environment* tab:
+
+   | Key | Value |
+   |---|---|
+   | `APP_ENV` | `production` |
+   | `DATABASE_URL` | the Neon connection string from step 1 |
+   | `JWT_SECRET` | output of `openssl rand -base64 48` (or `[Generate]` if Render offers it) |
+   | `COOKIE_SECURE` | `true` |
+   | `COOKIE_SAMESITE` | `none` |
+   | `TRUSTED_PROXY` | `true` |
+   | `FRONTEND_URL` | `https://<your-project>.vercel.app` (placeholder is fine for the first deploy; fix after step 3 below) |
+   | `CORS_ALLOWED_ORIGINS` | same as `FRONTEND_URL`, comma-separated if you add more origins later |
+   | `BOOTSTRAP_ADMIN_EMAIL` | e.g. `admin@yourcollege.edu` |
+   | `BOOTSTRAP_ADMIN_PASSWORD` | a temporary password, ≥ 10 chars — change it after first login |
+   | `BOOTSTRAP_ADMIN_NAME` | e.g. `Placement Officer` |
+   | `APP_TIMEZONE` | `Asia/Kolkata` (or your college's timezone) |
+
+   Render sets `PORT` itself and the app already binds `:8080` inside the container, which Render's Docker
+   runtime maps automatically — you don't need to set `HTTP_ADDR`.
+6. **Web Push (optional):** run `go run ./cmd/vapid` locally, then add `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`,
+   and `VAPID_SUBJECT=mailto:you@yourcollege.edu` to the same Environment tab. Skip this and push notifications
+   are simply off; the in-app inbox still works.
+7. **Uploads persist across deploys only with a paid disk.** Render's free/starter web services have an ephemeral
+   filesystem — anything written to `UPLOAD_DIR` (resumes) is lost on every redeploy or restart. For real use, either:
+   - add a Render **Persistent Disk** mounted at `/data/uploads` (Render dashboard → the service → *Disks*), or
+   - swap `internal/storage` for an S3-compatible backend (it's a small interface; see `internal/storage/storage.go`) — needed anyway to run more than one replica.
+8. **Create Web Service.** Render builds the Docker image and deploys; watch the logs for `listening` (or check `https://<service>.onrender.com/healthz` → `200 ok`). Migrations run automatically before the server starts serving.
+9. Note the assigned URL, e.g. `https://placementhub-backend.onrender.com` — the frontend needs it as `NEXT_PUBLIC_API_URL`.
+
+**Why `COOKIE_SAMESITE=none`:** Vercel and Render are different domains, so the refresh-token cookie is
+cross-site from the browser's point of view. Cross-site cookies require `SameSite=None; Secure` or the browser
+drops them silently and refresh (and therefore staying logged in) breaks. `COOKIE_SECURE=true` is required
+alongside it (the app already validates this combination at startup and refuses to boot otherwise).
+
+### 3. Frontend — Vercel
+
+See [placementhub-frontend/README.md](https://github.com/noobdivya/placementhub-frontend#deployment) — set `NEXT_PUBLIC_API_URL`
+to the Render URL from step 2.9, deploy, then come back here and set `FRONTEND_URL` / `CORS_ALLOWED_ORIGINS`
+to the exact `https://....vercel.app` domain Vercel assigns, and **manually redeploy** the Render service
+(env var changes don't auto-restart running instances' validated config the same way a fresh deploy does —
+use the *Manual Deploy* button, or just trigger it by pushing a commit).
+
+### Verifying
+
+```bash
+curl https://<service>.onrender.com/healthz    # {"status":"ok"}  (liveness)
+curl https://<service>.onrender.com/readyz     # checks the DB connection too
+```
+
+Then open the Vercel URL, log in with the `BOOTSTRAP_ADMIN_*` credentials, and change that password immediately
+(`/change-password`) — it was set in a plaintext env var.
+
+### Generic Docker deploy (any host)
 
 `docker build -t placementhub-api .` — a small non-root Alpine image with a health check (`/healthz`, `/readyz`). Run it behind HTTPS
 (Web Push and secure cookies need it), set `APP_ENV=production`, `TRUSTED_PROXY=true` if a proxy sets `X-Forwarded-For`, and mount a volume at `/data/uploads`.
