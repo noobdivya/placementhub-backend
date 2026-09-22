@@ -1,0 +1,455 @@
+openapi: 3.0.3
+info:
+  title: Placement Hub API
+  version: "1.0"
+  description: |
+    Student, recruiter and placement-cell API. Auth is a short-lived Bearer access token; the refresh token
+    lives in an httpOnly cookie (`ph_refresh`, path `/auth`). Errors always look like
+    `{"error": {"code": "...", "message": "...", "fields": {"field": "reason"}}}`.
+
+    A student who accepts an offer is PLACED: applying to jobs or registering for drives then fails with
+    `403 already_placed`, while their history stays readable.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearer: []
+tags:
+  - {name: Auth}
+  - {name: Student}
+  - {name: Jobs}
+  - {name: Applications}
+  - {name: Notifications}
+  - {name: Company}
+  - {name: Admin}
+  - {name: Public}
+
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: 'Sign in (sets the refresh cookie). Rate limited.'
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/LoginRequest"}}}}
+      responses:
+        "200": {description: Session, content: {application/json: {schema: {$ref: "#/components/schemas/Session"}}}}
+        "401": {$ref: "#/components/responses/Error"}
+        "429": {$ref: "#/components/responses/Error"}
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: 'Rotate the refresh cookie and get a new access token. Reusing an old cookie revokes the session.'
+      responses:
+        "200": {description: Session, content: {application/json: {schema: {$ref: "#/components/schemas/Session"}}}}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/logout:
+    post:
+      tags: [Auth]
+      security: []
+      summary: 'Revoke the refresh cookie''s session (idempotent).'
+      responses: {"204": {description: Signed out}}
+  /auth/register/company:
+    post:
+      tags: [Auth]
+      security: []
+      summary: 'Register a recruiter account. Starts Pending; may draft jobs but not submit them.'
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/CompanyRegistration"}}}}
+      responses:
+        "201": {description: Registered}
+        "409": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+  /auth/change-password:
+    post:
+      tags: [Auth]
+      summary: 'Change password (required after a temporary one). Signs out other sessions and returns a new session.'
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [currentPassword, newPassword], properties: {currentPassword: {type: string}, newPassword: {type: string, minLength: 8, maxLength: 72}}}}}}
+      responses:
+        "200": {description: Session, content: {application/json: {schema: {$ref: "#/components/schemas/Session"}}}}
+        "422": {$ref: "#/components/responses/Error"}
+  /me:
+    get:
+      tags: [Auth]
+      summary: 'The signed-in account plus its role profile (`student` or `company`).'
+      responses: {"200": {description: Account}}
+
+  # ---- student ---------------------------------------------------------------
+  /me/profile:
+    get: {tags: [Student], summary: "Own profile including placement status and resume metadata", responses: {"200": {description: Profile, content: {application/json: {schema: {$ref: "#/components/schemas/Profile"}}}}}}
+    put:
+      tags: [Student]
+      summary: 'Edit phone, about, 10th/12th %, links. CGPA, branch, backlogs, name, roll and email are read-only.'
+      responses: {"200": {description: Profile}, "422": {$ref: "#/components/responses/Error"}}
+  /me/skills:
+    post: {tags: [Student], summary: "Add a skill ({skill}); max 30, case-insensitive de-dupe", responses: {"200": {description: Skills}}}
+    delete:
+      tags: [Student]
+      summary: 'Remove a skill by name (query, because skills like C/C++ do not fit in a path)'
+      parameters: [{name: name, in: query, required: true, schema: {type: string}}]
+      responses: {"200": {description: Skills}}
+  /me/resume:
+    post:
+      tags: [Student]
+      summary: 'Upload a PDF resume (multipart field `file`, max 5 MB, replaces the previous one)'
+      requestBody: {required: true, content: {multipart/form-data: {schema: {type: object, properties: {file: {type: string, format: binary}}}}}}
+      responses: {"201": {description: Resume metadata}, "413": {$ref: "#/components/responses/Error"}, "422": {$ref: "#/components/responses/Error"}}
+    get: {tags: [Student], summary: "Download own resume (attachment)", responses: {"200": {description: PDF, content: {application/pdf: {}}}}}
+  /jobs:
+    get:
+      tags: [Jobs]
+      summary: 'Open jobs with per-student eligibility (`eligible`, `applied`, `canApply`, `blockReason`)'
+      parameters:
+        - {name: type, in: query, schema: {type: string, enum: [All, Full-time, Internship]}}
+        - {name: q, in: query, schema: {type: string}}
+        - {name: eligible, in: query, schema: {type: boolean}}
+        - {name: sort, in: query, schema: {type: string, enum: [deadline, ctc]}}
+        - {$ref: "#/components/parameters/page"}
+        - {$ref: "#/components/parameters/limit"}
+      responses: {"200": {description: Page of jobs, content: {application/json: {schema: {$ref: "#/components/schemas/JobPage"}}}}}
+  /jobs/{id}:
+    get:
+      tags: [Jobs]
+      summary: 'One job (closed jobs stay visible to students who applied)'
+      parameters: [{$ref: "#/components/parameters/id"}]
+      responses: {"200": {description: Job, content: {application/json: {schema: {$ref: "#/components/schemas/StudentJob"}}}}, "404": {$ref: "#/components/responses/Error"}}
+  /jobs/{id}/apply:
+    post:
+      tags: [Applications]
+      summary: 'Apply. 403 already_placed; 422 cgpa_too_low / branch_not_eligible / backlogs_not_allowed / resume_required / job_closed / deadline_passed; 409 already_applied.'
+      parameters: [{$ref: "#/components/parameters/id"}]
+      responses: {"201": {description: Application, content: {application/json: {schema: {$ref: "#/components/schemas/Application"}}}}, "403": {$ref: "#/components/responses/Error"}, "409": {$ref: "#/components/responses/Error"}, "422": {$ref: "#/components/responses/Error"}}
+  /me/applications:
+    get: {tags: [Applications], summary: "Every application ever made, including Withdrawn and Rejected", responses: {"200": {description: Items}}}
+  /me/applications/{id}/withdraw:
+    post: {tags: [Applications], summary: "Withdraw a live application (use decline for an offered one)", parameters: [{$ref: "#/components/parameters/id"}], responses: {"200": {description: Application}}}
+  /me/offers:
+    get: {tags: [Applications], summary: "The student's offers", responses: {"200": {description: Items}}}
+  /me/offers/{id}/accept:
+    post:
+      tags: [Applications]
+      summary: |
+        Accept an offer. The student becomes PLACED; other live applications are withdrawn, other pending offers declined,
+        upcoming drive registrations cancelled. Idempotent.
+      parameters: [{$ref: "#/components/parameters/id"}]
+      responses: {"200": {description: Result, content: {application/json: {schema: {$ref: "#/components/schemas/AcceptResult"}}}}, "409": {$ref: "#/components/responses/Error"}}
+  /me/offers/{id}/decline:
+    post: {tags: [Applications], summary: "Decline an offer ({reason} optional); the application becomes Withdrawn", parameters: [{$ref: "#/components/parameters/id"}], responses: {"200": {description: Offer}}}
+  /drives:
+    get:
+      tags: [Student]
+      summary: 'Upcoming/ongoing drives (`scope=past` for finished) with `isRegistered`, `canRegister`, `blockReason`'
+      parameters: [{name: scope, in: query, schema: {type: string, enum: [upcoming, past]}}]
+      responses: {"200": {description: Items}}
+  /drives/{id}/register:
+    post: {tags: [Student], summary: "Register (idempotent). 403 already_placed; 422 when ineligible or the drive has started.", parameters: [{$ref: "#/components/parameters/id"}], responses: {"200": {description: Drive}}}
+    delete: {tags: [Student], summary: "Cancel a registration before the drive starts", parameters: [{$ref: "#/components/parameters/id"}], responses: {"204": {description: Cancelled}}}
+
+  # ---- notifications (students) ----------------------------------------------
+  /push/vapid-public-key:
+    get: {tags: [Notifications], security: [], summary: "Public VAPID key for pushManager.subscribe (503 push_disabled if not configured)", responses: {"200": {description: "{publicKey}"}}}
+  /me/push-subscriptions:
+    post:
+      tags: [Notifications]
+      summary: 'Register this browser (body is PushSubscription.toJSON()). Only recognised push-service hosts are accepted.'
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/PushSubscription"}}}}
+      responses: {"201": {description: Subscribed}, "422": {$ref: "#/components/responses/Error"}}
+    delete:
+      tags: [Notifications]
+      summary: "Remove this device ({endpoint})"
+      responses: {"204": {description: Removed}}
+  /me/notification-preferences:
+    get: {tags: [Notifications], summary: "Master switch, per-category mutes, device count", responses: {"200": {description: Preferences, content: {application/json: {schema: {$ref: "#/components/schemas/Preferences"}}}}}}
+    put:
+      tags: [Notifications]
+      summary: 'Mute/unmute. Body `{"pushEnabled"?: bool, "categories"?: {"new_job": false}}`. `critical` cannot be muted individually.'
+      responses: {"200": {description: Preferences}, "422": {$ref: "#/components/responses/Error"}}
+  /me/notifications:
+    get:
+      tags: [Notifications]
+      summary: 'Inbox, newest first, cursor-paginated'
+      parameters:
+        - {name: unread, in: query, schema: {type: boolean}}
+        - {name: limit, in: query, schema: {type: integer, maximum: 100}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses: {"200": {description: "{items, nextCursor}"}}
+  /me/notifications/unread-count:
+    get: {tags: [Notifications], summary: "Badge count", responses: {"200": {description: "{count}"}}}
+  /me/notifications/{id}/read:
+    post: {tags: [Notifications], summary: "Mark read", parameters: [{$ref: "#/components/parameters/id"}], responses: {"204": {description: Read}}}
+  /me/notifications/read-all:
+    post: {tags: [Notifications], summary: "Mark everything read", responses: {"200": {description: "{updated}"}}}
+
+  # ---- company ---------------------------------------------------------------
+  /company/profile:
+    get: {tags: [Company], summary: "Own company (status Pending/Approved/Rejected)", responses: {"200": {description: Company}}}
+    put: {tags: [Company], summary: "Edit industry, hr, phone", responses: {"200": {description: Company}}}
+  /company/jobs:
+    get: {tags: [Company], summary: "All own postings in every status", responses: {"200": {description: Items}}}
+    post:
+      tags: [Company]
+      summary: 'Create a draft; `"submit": true` also sends it for approval'
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/JobInput"}}}}
+      responses: {"201": {description: Job}, "422": {$ref: "#/components/responses/Error"}}
+  /company/jobs/{id}:
+    get: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "One own posting", responses: {"200": {description: Job}}}
+    put: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "Edit. Draft/Rejected: everything. Open: only deadline, openings, skills, description (409 criteria_locked otherwise).", responses: {"200": {description: Job}}}
+    delete: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "Delete a draft", responses: {"204": {description: Deleted}}}
+  /company/jobs/{id}/submit:
+    post: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "Send for approval (422 company_not_approved until the company is approved)", responses: {"200": {description: Job}}}
+  /company/jobs/{id}/close:
+    post: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "Stop taking applications", responses: {"200": {description: Job}}}
+  /company/candidates:
+    get:
+      tags: [Company]
+      summary: 'Applicants to own jobs (Withdrawn hidden unless includeWithdrawn=true)'
+      parameters:
+        - {name: jobId, in: query, schema: {type: string, format: uuid}}
+        - {name: stage, in: query, schema: {type: string}}
+        - {name: includeWithdrawn, in: query, schema: {type: boolean}}
+      responses: {"200": {description: Items of Candidate}}
+  /company/applications/{id}:
+    get: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "Full candidate profile and stage history", responses: {"200": {description: Candidate profile}}}
+  /company/applications/{id}/stage:
+    patch:
+      tags: [Company]
+      summary: |
+        Move a candidate. Allowed: one step forward, Rejected from any live stage, reset to Applied. Moving to Offered creates an offer
+        (`ctc`, `validUntil` optional). 409 offer_accepted / application_withdrawn / student_placed.
+      parameters: [{$ref: "#/components/parameters/id"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [stage], properties: {stage: {type: string, enum: [Applied, Shortlisted, Interview, Offered, Rejected]}, note: {type: string}, ctc: {type: number}, validUntil: {type: string, format: date-time}}}}}}
+      responses: {"200": {description: Candidate}, "409": {$ref: "#/components/responses/Error"}, "422": {$ref: "#/components/responses/Error"}}
+  /company/applications/{id}/resume:
+    get: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "Download an own applicant's resume", responses: {"200": {description: PDF}}}
+
+  # ---- admin -----------------------------------------------------------------
+  /admin/students:
+    get:
+      tags: [Admin]
+      summary: 'Students with derived status (Placed / In process / Unplaced)'
+      parameters:
+        - {name: q, in: query, schema: {type: string}}
+        - {name: branch, in: query, schema: {type: string}}
+        - {name: status, in: query, schema: {type: string, enum: [All, Placed, In process, Unplaced]}}
+        - {$ref: "#/components/parameters/page"}
+        - {$ref: "#/components/parameters/limit"}
+      responses: {"200": {description: Page}}
+    post: {tags: [Admin], summary: "Create a student; returns a one-time temporary password", responses: {"201": {description: Created}}}
+  /admin/students/import:
+    post: {tags: [Admin], summary: "CSV import (name, roll, email, branch, cgpa; optional year, backlogs, phone; max 500 rows). Partial success with per-row errors.", responses: {"200": {description: "{created, errors}"}}}
+  /admin/students/export.csv:
+    get: {tags: [Admin], summary: "Students as CSV", responses: {"200": {description: CSV}}}
+  /admin/students/{id}:
+    get: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Student profile", responses: {"200": {description: Profile}}}
+    patch: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Edit academics (name, branch, year, cgpa, backlogs)", responses: {"200": {description: Profile}}}
+  /admin/students/{id}/applications:
+    get: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "The student's full application history", responses: {"200": {description: Items}}}
+  /admin/students/{id}/activate:
+    post: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Enable login", responses: {"204": {description: Done}}}
+  /admin/students/{id}/deactivate:
+    post: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Disable login and sign out everywhere", responses: {"204": {description: Done}}}
+  /admin/students/{id}/reset-password:
+    post: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Issue a temporary password", responses: {"200": {description: "{tempPassword}"}}}
+  /admin/admins:
+    post: {tags: [Admin], summary: "Add another placement-cell account (temporary password)", responses: {"201": {description: Created}}}
+  /admin/companies:
+    get: {tags: [Admin], parameters: [{name: status, in: query, schema: {type: string}}], summary: "Companies with derived openRoles, hires, lastVisit", responses: {"200": {description: Items}}}
+  /admin/companies/{id}/status:
+    patch: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Approve / Reject / reset to Pending ({status, reason}); rejecting closes its live jobs", responses: {"200": {description: Company}}}
+  /admin/companies/{id}/reset-password:
+    post: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Issue a recruiter a temporary password", responses: {"200": {description: "{tempPassword}"}}}
+  /admin/jobs:
+    get: {tags: [Admin], parameters: [{name: status, in: query, schema: {type: string, enum: [All, Pending, Open, Closed, Rejected]}}], summary: "Submitted jobs (drafts are private)", responses: {"200": {description: Items}}}
+  /admin/jobs/{id}/approve:
+    post: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Make a pending job live and notify exactly the eligible students ({job, studentsNotified})", responses: {"200": {description: Result}}}
+  /admin/jobs/{id}/reject:
+    post: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Send back with a required {reason}", responses: {"200": {description: Job}}}
+  /admin/jobs/{id}/close:
+    post: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Close any live job", responses: {"200": {description: Job}}}
+  /admin/offers/{id}/revoke:
+    post: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Revoke an accepted offer ({reason}); the student stops being placed", responses: {"200": {description: Offer}}}
+  /admin/drives:
+    get: {tags: [Admin], parameters: [{name: status, in: query, schema: {type: string, enum: [All, Upcoming, Ongoing, Completed]}}], summary: "Drives with registered/eligible counts", responses: {"200": {description: Items}}}
+    post: {tags: [Admin], summary: "Schedule a drive; eligible students are notified", responses: {"201": {description: Drive}}}
+  /admin/drives/{id}:
+    get: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "One drive", responses: {"200": {description: Drive}}}
+    put: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Edit; registered students are notified only if time, mode or venue change", responses: {"200": {description: Drive}}}
+    delete: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Cancel (registered students are told)", responses: {"204": {description: Deleted}}}
+  /admin/drives/{id}/registrations:
+    get: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Roster", responses: {"200": {description: Items}}}
+  /admin/notices:
+    post: {tags: [Admin], summary: 'Publish a notice; `"notify": true` also pushes it (optionally to `branches`)', responses: {"201": {description: "{notice, studentsNotified}"}}}
+  /admin/notices/{id}:
+    delete: {tags: [Admin], parameters: [{$ref: "#/components/parameters/id"}], summary: "Remove a notice", responses: {"204": {description: Deleted}}}
+  /admin/site-config:
+    put: {tags: [Admin], summary: "Replace the home-page content document (JSON object, max 64 KB)", responses: {"204": {description: Saved}}}
+  /admin/reports/summary:
+    get: {tags: [Admin], summary: "{totalStudents, placed, avgCtc, highestCtc, companiesVisited, offers}", responses: {"200": {description: Summary}}}
+  /admin/reports/monthly-offers:
+    get: {tags: [Admin], summary: "Offers per month, last six, zero-filled", responses: {"200": {description: "[{label, value}]"}}}
+  /admin/reports/branches:
+    get: {tags: [Admin], summary: "[{branch, total, placed}]", responses: {"200": {description: Items}}}
+  /admin/reports/ctc-bands:
+    get: {tags: [Admin], summary: "Accepted offers by CTC band", responses: {"200": {description: "[{label, value}]"}}}
+  /admin/reports/top-recruiters:
+    get: {tags: [Admin], summary: "Top five by hires", responses: {"200": {description: "[{name, hires, color}]"}}}
+  /admin/reports/recent-offers:
+    get: {tags: [Admin], summary: "Ten most recent offers (rescinded excluded)", responses: {"200": {description: Items}}}
+  /admin/reports/overview:
+    get: {tags: [Admin], summary: "Every dashboard block in one call", responses: {"200": {description: Overview}}}
+  /admin/reports/placements.csv:
+    get: {tags: [Admin], summary: "Accepted offers as CSV", responses: {"200": {description: CSV}}}
+
+  # ---- public ----------------------------------------------------------------
+  /notices:
+    get: {tags: [Public], security: [], summary: "Notice board", parameters: [{$ref: "#/components/parameters/limit"}], responses: {"200": {description: "{items: [{id, date, tag, title}]}"}}}
+  /recruiters:
+    get: {tags: [Public], security: [], summary: "Approved companies", responses: {"200": {description: "{items: [{name, color}]}"}}}
+  /site-config:
+    get: {tags: [Public], security: [], summary: "Home-page content (college details, hero, desk messages, testimonials)", responses: {"200": {description: JSON object}}}
+  /healthz:
+    get: {tags: [Public], security: [], summary: "Liveness", responses: {"200": {description: ok}}}
+  /readyz:
+    get: {tags: [Public], security: [], summary: "Readiness (checks the database)", responses: {"200": {description: ready}, "503": {$ref: "#/components/responses/Error"}}}
+
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer, bearerFormat: JWT}
+  parameters:
+    id: {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+    page: {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+    limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+  responses:
+    Error:
+      description: Error
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: {type: string, example: already_placed}
+            message: {type: string}
+            fields: {type: object, additionalProperties: {type: string}}
+    LoginRequest: {type: object, required: [email, password], properties: {email: {type: string}, password: {type: string}}}
+    CompanyRegistration:
+      type: object
+      required: [companyName, hrName, email, password]
+      properties: {companyName: {type: string}, industry: {type: string}, hrName: {type: string}, email: {type: string}, phone: {type: string}, password: {type: string}}
+    Session:
+      type: object
+      properties:
+        accessToken: {type: string}
+        expiresAt: {type: string, format: date-time}
+        user: {type: object, properties: {id: {type: string, format: uuid}, email: {type: string}, name: {type: string}, role: {type: string, enum: [student, company, admin]}, mustChangePassword: {type: boolean}}}
+    Profile:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        roll: {type: string}
+        email: {type: string}
+        phone: {type: string}
+        branch: {type: string}
+        year: {type: string}
+        cgpa: {type: number}
+        backlogs: {type: integer}
+        tenth: {type: number, nullable: true}
+        twelfth: {type: number, nullable: true}
+        skills: {type: array, items: {type: string}}
+        links: {type: object, properties: {github: {type: string}, linkedin: {type: string}}}
+        about: {type: string}
+        resume: {type: object, nullable: true, properties: {filename: {type: string}, sizeBytes: {type: integer}, uploadedAt: {type: string, format: date-time}}}
+        placement:
+          type: object
+          properties:
+            status: {type: string, enum: [Placed, In process, Unplaced]}
+            offerId: {type: string}
+            company: {type: string}
+            role: {type: string}
+            ctc: {type: number}
+    Job:
+      type: object
+      properties:
+        id: {type: string}
+        companyId: {type: string}
+        company: {type: string}
+        color: {type: string}
+        role: {type: string}
+        type: {type: string, enum: [Full-time, Internship]}
+        location: {type: string}
+        ctc: {type: number}
+        minCgpa: {type: number}
+        branches: {type: array, items: {type: string}}
+        skills: {type: array, items: {type: string}}
+        deadline: {type: string, format: date}
+        openings: {type: integer}
+        applicants: {type: integer}
+        status: {type: string, enum: [Draft, Pending, Open, Closed, Rejected]}
+        description: {type: string}
+        allowBacklogs: {type: boolean}
+        rejectReason: {type: string}
+    StudentJob:
+      allOf:
+        - $ref: "#/components/schemas/Job"
+        - type: object
+          properties:
+            eligible: {type: boolean}
+            applied: {type: boolean}
+            applicationId: {type: string, nullable: true}
+            canApply: {type: boolean}
+            blockReason: {type: object, nullable: true, properties: {code: {type: string}, message: {type: string}}}
+    JobPage:
+      type: object
+      properties: {items: {type: array, items: {$ref: "#/components/schemas/StudentJob"}}, total: {type: integer}, page: {type: integer}, limit: {type: integer}}
+    JobInput:
+      type: object
+      required: [role, type, location, ctc, branches, deadline, openings, description]
+      properties:
+        role: {type: string}
+        type: {type: string, enum: [Full-time, Internship]}
+        location: {type: string}
+        ctc: {type: number}
+        minCgpa: {type: number}
+        branches: {type: array, items: {type: string}}
+        skills: {type: array, items: {type: string}}
+        deadline: {type: string, format: date}
+        openings: {type: integer}
+        description: {type: string}
+        allowBacklogs: {type: boolean}
+        submit: {type: boolean}
+    Application:
+      type: object
+      properties:
+        id: {type: string}
+        jobId: {type: string}
+        company: {type: string}
+        color: {type: string}
+        role: {type: string}
+        appliedOn: {type: string, format: date}
+        stage: {type: string, enum: [Applied, Shortlisted, Interview, Offered, Rejected, Withdrawn]}
+        note: {type: string}
+        offer: {type: object, nullable: true, properties: {id: {type: string}, status: {type: string, enum: [Pending, Accepted, Declined, Expired, Rescinded]}, ctc: {type: number}, validUntil: {type: string, format: date-time}}}
+    AcceptResult:
+      type: object
+      properties:
+        offer: {type: object}
+        status: {type: string, enum: [Placed]}
+        applicationsWithdrawn: {type: integer}
+        offersDeclined: {type: integer}
+        driveRegistrationsCancelled: {type: integer}
+    PushSubscription:
+      type: object
+      required: [endpoint, keys]
+      properties:
+        endpoint: {type: string, format: uri}
+        keys: {type: object, required: [p256dh, auth], properties: {p256dh: {type: string}, auth: {type: string}}}
+    Preferences:
+      type: object
+      properties:
+        pushAvailable: {type: boolean}
+        pushEnabled: {type: boolean}
+        devices: {type: integer}
+        categories:
+          type: array
+          items: {type: object, properties: {category: {type: string, enum: [new_job, application_update, deadline, drive, notice, critical]}, label: {type: string}, push: {type: boolean}, mutable: {type: boolean}}}
