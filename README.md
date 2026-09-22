@@ -7,7 +7,8 @@ The domain model mirrors `placementhub/lib/data.ts`; every export there has an e
 See [openapi.yaml](openapi.yaml) for the full API and [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the design decisions.
 
 Live stack: **[Vercel](https://vercel.com)** (frontend) → **this API on [Render](https://render.com)** → **[Neon](https://neon.tech)** (Postgres).
-Frontend repo: [placementhub-frontend](https://github.com/noobdivya/placementhub-frontend).
+Frontend repo: [placementhub-frontend](https://github.com/noobdivya/placementhub-frontend) — live at [placementhub-sepia.vercel.app](https://placementhub-sepia.vercel.app).
+Live API: [placementhub-api-s9cj.onrender.com](https://placementhub-api-s9cj.onrender.com) (`/healthz`, `/readyz`).
 
 ## Quick start (local)
 
@@ -213,6 +214,26 @@ curl https://<service>.onrender.com/readyz     # checks the DB connection too
 
 Then open the Vercel URL, log in with the `BOOTSTRAP_ADMIN_*` credentials, and change that password immediately
 (`/change-password`) — it was set in a plaintext env var.
+
+### Neon pooler gotchas (already fixed here, worth knowing if you touch `internal/db`)
+
+Neon's pooled endpoint is PgBouncer in transaction-pooling mode, which is stricter about how a Postgres client
+behaves than a direct connection. Two `pgx` defaults broke against it in production; both are already fixed in
+this codebase, documented here so a future change to `internal/db` doesn't reintroduce them.
+
+1. **Named prepared statements collide.** `pgx`'s default query mode caches a prepared statement per connection.
+   A pooled connection can be handed to a different session between statements, so a cached statement name can
+   collide with one an unrelated session already prepared on that backend — `FATAL: prepared statement
+   "..." already exists` (SQLSTATE `08P01`), intermittently (a race, not deterministic). Fixed by setting
+   `DefaultQueryExecMode = pgx.QueryExecModeExec` on both the pool (`db.Connect`) and the migration connection
+   (`db.Migrate`) — unnamed statements via the extended protocol, so nothing to collide, with no real cost.
+2. **That same mode change breaks plain `[]byte` JSON parameters.** Without the Describe step `QueryExecModeExec`
+   skips, `pgx` has no way to learn a parameter's real column type, so it falls back to its default mapping for
+   a bare `[]byte` — `bytea` — which Postgres then rejects when the target is `jsonb` (`invalid input syntax for
+   type json`, SQLSTATE `22P02`). `encoding/json.RawMessage` (not a plain `[]byte`) has a default mapping
+   straight to `json`/`jsonb` and needs no Describe. Every write to a jsonb column (`internal/audit.Log`,
+   `internal/notify.Notifier.ToUsers`, `internal/site.Service.SetConfig`) passes `json.RawMessage`, not `[]byte`,
+   for exactly this reason — keep it that way if you add another one.
 
 ### Generic Docker deploy (any host)
 
