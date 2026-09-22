@@ -36,6 +36,14 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
+	// Through a transaction-mode pooler (PgBouncer — Neon's pooled endpoint is
+	// one), a connection can be handed to a different session between
+	// statements, so pgx's default named, cached prepared statements can
+	// collide with another session's ("prepared statement ... already in
+	// use", SQLSTATE 08P01). QueryExecModeExec still uses the fast extended
+	// protocol but with an unnamed statement each time, which is safe with
+	// or without a pooler in front.
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -53,6 +61,7 @@ func Migrate(ctx context.Context, url string) error {
 	if err != nil {
 		return err
 	}
+	cfg.DefaultQueryExecMode = pgx.QueryExecModeExec // see Connect: same pooler-safety reason
 	sqlDB := stdlib.OpenDB(*cfg)
 	defer sqlDB.Close()
 	return migrateDB(ctx, sqlDB)
