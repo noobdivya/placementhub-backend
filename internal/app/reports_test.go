@@ -4,10 +4,13 @@ import (
 	"strings"
 	"testing"
 
+	"placementhub/internal/domain"
 	"placementhub/internal/testutil"
 )
 
-var allBranches = []string{"CSE", "IT", "ECE", "EEE", "Mechanical", "Civil"}
+// The real branch list, not a hand-maintained copy — so this test can't drift
+// out of sync with internal/domain.Branches the way it just did.
+var allBranches = domain.Branches
 
 func TestReportsMatchTheUnderlyingData(t *testing.T) {
 	w := newWorld(t)
@@ -71,14 +74,21 @@ func TestReportsMatchTheUnderlyingData(t *testing.T) {
 	}
 
 	branches := decodeArray(e.Get(w.admin, "/admin/reports/branches"))
-	if len(branches) != 6 || branches[0]["branch"] != "CSE" || branches[5]["branch"] != "Civil" {
+	if len(branches) != len(domain.Branches) || branches[0]["branch"] != domain.Branches[0] ||
+		branches[len(branches)-1]["branch"] != domain.Branches[len(domain.Branches)-1] {
 		t.Fatalf("branches = %v", branches)
 	}
 	got := map[string][2]float64{}
 	for _, b := range branches {
 		got[b["branch"].(string)] = [2]float64{b["total"].(float64), b["placed"].(float64)}
 	}
-	for br, tp := range map[string][2]float64{"CSE": {2, 2}, "IT": {1, 1}, "ECE": {1, 1}, "EEE": {2, 0}, "Mechanical": {0, 0}, "Civil": {0, 0}} {
+	wantBranch := map[string][2]float64{"CSE": {2, 2}, "IT": {1, 1}, "ECE": {1, 1}, "EEE": {2, 0}}
+	for _, b := range domain.Branches {
+		if _, ok := wantBranch[b]; !ok {
+			wantBranch[b] = [2]float64{0, 0} // every other branch has no students in this test
+		}
+	}
+	for br, tp := range wantBranch {
 		if got[br] != tp {
 			t.Errorf("branch %s total/placed = %v, want %v", br, got[br], tp)
 		}

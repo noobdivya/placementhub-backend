@@ -57,7 +57,7 @@ const (
 	StudentUnplaced  = "Unplaced"
 )
 
-var Branches = []string{"CSE", "IT", "ECE", "EEE", "Mechanical", "Civil"}
+var Branches = []string{"CSE", "IT", "ECE", "EEE", "Mechanical", "Civil", "BBA", "BCA", "MBA"}
 
 func ValidBranch(b string) bool { return slices.Contains(Branches, b) }
 
