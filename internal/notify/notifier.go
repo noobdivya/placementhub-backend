@@ -54,10 +54,13 @@ func (n *Notifier) ToUsers(ctx context.Context, q db.DBTX, recipientsSQL string,
 	if data == nil {
 		data = map[string]any{}
 	}
-	raw, err := json.Marshal(data)
+	rawBytes, err := json.Marshal(data)
 	if err != nil {
 		return 0, err
 	}
+	// json.RawMessage, not the bare []byte json.Marshal returns — see the same
+	// note in internal/audit.Log; this is the $7::jsonb parameter below.
+	raw := json.RawMessage(rawBytes)
 	k := len(args)
 	stmt := fmt.Sprintf(`
 WITH recipients AS (%[1]s),

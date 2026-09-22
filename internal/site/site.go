@@ -39,7 +39,13 @@ func (s *Service) Config(ctx context.Context) (json.RawMessage, error) {
 func (s *Service) SetConfig(ctx context.Context, raw json.RawMessage) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO site_settings (key, value) VALUES ($1, $2)
-		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, configKey, []byte(raw))
+		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+		// raw, not []byte(raw): json.RawMessage has a default pgx type mapping to
+		// json/jsonb; casting it to a plain []byte throws that away and falls
+		// back to bytea encoding, which Postgres then rejects for this jsonb
+		// column under QueryExecModeExec (see internal/audit.Log for the
+		// full explanation — same root cause).
+		configKey, raw)
 	return err
 }
 
