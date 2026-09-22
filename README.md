@@ -136,7 +136,7 @@ Deploy in this order so each step has the value it needs from the previous one:
 
 1. **Neon** — create the database, copy the connection string.
 2. **Render** — deploy this repo with that connection string.
-3. **[Vercel](https://github.com/noobdivya/placementhub-frontend#deployment)** — deploy the frontend pointed at the Render URL.
+3. **[Vercel](https://github.com/noobdivya/placementhub-frontend)** — deploy the frontend pointed at the Render URL.
 4. Come back to Render and set `CORS_ALLOWED_ORIGINS`/`FRONTEND_URL` to the final Vercel URL, then redeploy.
 
 ### 1. Database — Neon
@@ -199,7 +199,7 @@ alongside it (the app already validates this combination at startup and refuses 
 
 ### 3. Frontend — Vercel
 
-See [placementhub-frontend/README.md](https://github.com/noobdivya/placementhub-frontend#deployment) — set `NEXT_PUBLIC_API_URL`
+Deploy [placementhub-frontend](https://github.com/noobdivya/placementhub-frontend) on Vercel — set `NEXT_PUBLIC_API_URL`
 to the Render URL from step 2.9, deploy, then come back here and set `FRONTEND_URL` / `CORS_ALLOWED_ORIGINS`
 to the exact `https://....vercel.app` domain Vercel assigns, and **manually redeploy** the Render service
 (env var changes don't auto-restart running instances' validated config the same way a fresh deploy does —
