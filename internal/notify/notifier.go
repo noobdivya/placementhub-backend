@@ -1,13 +1,15 @@
-// Package notify creates in-app notifications and queues Web Push deliveries.
+// Package notify creates in-app notifications and queues Web Push and email deliveries.
 package notify
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"placementhub/internal/db"
 	"placementhub/internal/domain"
+	"placementhub/internal/email"
 
 	"github.com/google/uuid"
 )
@@ -20,15 +22,27 @@ type Spec struct {
 	Link      string
 	Data      map[string]any
 	DedupeKey string // unique per recipient; re-sending the same key is a no-op
+
+	// Email, when set, also queues an email for every recipient (subject to
+	// the master email switch and per-category mute, exactly like push).
+	// It carries structured content — company/round/schedule/etc — since a
+	// good email needs far more than the plain Title/Body a push payload
+	// gets by; internal/email.Render turns it into the actual subject/HTML/
+	// text once, here, rather than every call site hand-writing markup.
+	Email *email.Content
 }
 
 // Notifier writes notifications inside the caller's transaction, so a
 // notification exists if and only if the change that caused it committed.
 type Notifier struct {
-	pushEnabled bool
+	pushEnabled  bool
+	emailEnabled bool
+	frontendURL  string
 }
 
-func New(pushEnabled bool) *Notifier { return &Notifier{pushEnabled: pushEnabled} }
+func New(pushEnabled, emailEnabled bool, frontendURL string) *Notifier {
+	return &Notifier{pushEnabled: pushEnabled, emailEnabled: emailEnabled, frontendURL: strings.TrimRight(frontendURL, "/")}
+}
 
 // ToUser notifies one user. It reports whether a new notification was created.
 func (n *Notifier) ToUser(ctx context.Context, q db.DBTX, userID uuid.UUID, s Spec) (bool, error) {
@@ -40,12 +54,12 @@ func (n *Notifier) ToUser(ctx context.Context, q db.DBTX, userID uuid.UUID, s Sp
 // single `user_id` column and uses $1..$len(args) for its own parameters.
 // It returns how many notifications were created.
 //
-// One statement inserts the inbox rows (skipping duplicates by dedupe key) and
-// queues a push per device for recipients who allow it:
-//   - the master push switch is on (default on), and
-//   - the category is not muted (critical interviews/offers ignore per-category mutes).
+// One statement inserts the inbox rows (skipping duplicates by dedupe key),
+// queues a push per device, and queues an email — each gated independently by
+// its own master switch and per-category mute (critical interviews/offers/
+// round events ignore per-category mutes on both channels).
 //
-// Muted recipients still get the inbox row; only the push is withheld.
+// Muted recipients still get the inbox row; only push/email are withheld.
 func (n *Notifier) ToUsers(ctx context.Context, q db.DBTX, recipientsSQL string, args []any, s Spec) (int64, error) {
 	if s.Type == "" || s.DedupeKey == "" || s.Title == "" {
 		return 0, fmt.Errorf("notify: type, title and dedupe key are required")
@@ -61,6 +75,13 @@ func (n *Notifier) ToUsers(ctx context.Context, q db.DBTX, recipientsSQL string,
 	// json.RawMessage, not the bare []byte json.Marshal returns — see the same
 	// note in internal/audit.Log; this is the $7::jsonb parameter below.
 	raw := json.RawMessage(rawBytes)
+
+	var subject, emailHTML, emailText string
+	hasEmail := s.Email != nil
+	if hasEmail {
+		subject, emailHTML, emailText = email.Render(s.Type, *s.Email, n.frontendURL+s.Link)
+	}
+
 	k := len(args)
 	stmt := fmt.Sprintf(`
 WITH recipients AS (%[1]s),
@@ -82,11 +103,24 @@ queued AS (
        AND COALESCE(ns.push_enabled, true)
        AND ($%[3]d::text = 'critical' OR COALESCE(np.push, true))
     RETURNING 1
+),
+emailed AS (
+    INSERT INTO email_outbox (notification_id, to_email, to_name, subject, body_html, body_text)
+    SELECT ins.id, u.email, u.name, $%[10]d::text, $%[11]d::text, $%[12]d::text
+      FROM ins
+      JOIN users u ON u.id = ins.user_id
+      LEFT JOIN notification_settings ns ON ns.user_id = ins.user_id
+      LEFT JOIN notification_preferences np ON np.user_id = ins.user_id AND np.category = $%[3]d::text
+     WHERE $%[13]d::boolean AND $%[14]d::boolean
+       AND COALESCE(ns.email_enabled, true)
+       AND ($%[3]d::text = 'critical' OR COALESCE(np.email, true))
+    RETURNING 1
 )
-SELECT count(*) FROM ins`, recipientsSQL, k+1, k+2, k+3, k+4, k+5, k+6, k+7, k+8)
+SELECT count(*) FROM ins`, recipientsSQL, k+1, k+2, k+3, k+4, k+5, k+6, k+7, k+8, k+9, k+10, k+11, k+12, k+13)
 
 	all := append(append([]any{}, args...),
-		s.Type, domain.CategoryFor(s.Type), s.Title, s.Body, s.Link, raw, s.DedupeKey, n.pushEnabled)
+		s.Type, domain.CategoryFor(s.Type), s.Title, s.Body, s.Link, raw, s.DedupeKey,
+		n.pushEnabled, subject, emailHTML, emailText, n.emailEnabled, hasEmail)
 
 	var count int64
 	if err := q.QueryRow(ctx, stmt, all...).Scan(&count); err != nil {

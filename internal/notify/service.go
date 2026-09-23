@@ -31,12 +31,13 @@ var AllowedPushHosts = []string{
 const maxSubscriptionsPerUser = 10
 
 type Service struct {
-	pool        *pgxpool.Pool
-	pushEnabled bool
+	pool         *pgxpool.Pool
+	pushEnabled  bool
+	emailEnabled bool
 }
 
-func NewService(pool *pgxpool.Pool, pushEnabled bool) *Service {
-	return &Service{pool: pool, pushEnabled: pushEnabled}
+func NewService(pool *pgxpool.Pool, pushEnabled, emailEnabled bool) *Service {
+	return &Service{pool: pool, pushEnabled: pushEnabled, emailEnabled: emailEnabled}
 }
 
 type Item struct {
@@ -154,14 +155,17 @@ type CategoryPref struct {
 	Category string `json:"category"`
 	Label    string `json:"label"`
 	Push     bool   `json:"push"`
+	Email    bool   `json:"email"`
 	Mutable  bool   `json:"mutable"`
 }
 
 type Preferences struct {
-	PushAvailable bool           `json:"pushAvailable"` // server has VAPID keys configured
-	PushEnabled   bool           `json:"pushEnabled"`   // master switch
-	Devices       int            `json:"devices"`
-	Categories    []CategoryPref `json:"categories"`
+	PushAvailable  bool           `json:"pushAvailable"`  // server has VAPID keys configured
+	PushEnabled    bool           `json:"pushEnabled"`    // master switch
+	EmailAvailable bool           `json:"emailAvailable"` // server has RESEND_API_KEY/EMAIL_FROM configured
+	EmailEnabled   bool           `json:"emailEnabled"`   // master switch
+	Devices        int            `json:"devices"`
+	Categories     []CategoryPref `json:"categories"`
 }
 
 var categoryLabels = map[string]string{
@@ -174,45 +178,50 @@ var categoryLabels = map[string]string{
 }
 
 func (s *Service) Preferences(ctx context.Context, userID uuid.UUID) (*Preferences, error) {
-	p := &Preferences{PushAvailable: s.pushEnabled, PushEnabled: true}
+	p := &Preferences{PushAvailable: s.pushEnabled, PushEnabled: true, EmailAvailable: s.emailEnabled, EmailEnabled: true}
 	err := s.pool.QueryRow(ctx,
 		`SELECT COALESCE((SELECT push_enabled FROM notification_settings WHERE user_id = $1), true),
-		        (SELECT count(*) FROM push_subscriptions WHERE user_id = $1)`, userID).Scan(&p.PushEnabled, &p.Devices)
+		        COALESCE((SELECT email_enabled FROM notification_settings WHERE user_id = $1), true),
+		        (SELECT count(*) FROM push_subscriptions WHERE user_id = $1)`, userID).
+		Scan(&p.PushEnabled, &p.EmailEnabled, &p.Devices)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT category, push FROM notification_preferences WHERE user_id = $1`, userID)
+	rows, err := s.pool.Query(ctx, `SELECT category, push, email FROM notification_preferences WHERE user_id = $1`, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	set := map[string]bool{}
+	type pref struct{ push, email bool }
+	set := map[string]pref{}
 	for rows.Next() {
 		var c string
-		var push bool
-		if err := rows.Scan(&c, &push); err != nil {
+		var p pref
+		if err := rows.Scan(&c, &p.push, &p.email); err != nil {
 			return nil, err
 		}
-		set[c] = push
+		set[c] = p
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	for _, c := range domain.MutableCategories {
-		push, ok := set[c]
+		p2, ok := set[c]
 		if !ok {
-			push = true
+			p2 = pref{push: true, email: true}
 		}
-		p.Categories = append(p.Categories, CategoryPref{Category: c, Label: categoryLabels[c], Push: push, Mutable: true})
+		p.Categories = append(p.Categories, CategoryPref{Category: c, Label: categoryLabels[c], Push: p2.push, Email: p2.email, Mutable: true})
 	}
 	p.Categories = append(p.Categories, CategoryPref{
-		Category: domain.CatCritical, Label: categoryLabels[domain.CatCritical], Push: true, Mutable: false})
+		Category: domain.CatCritical, Label: categoryLabels[domain.CatCritical], Push: true, Email: true, Mutable: false})
 	return p, nil
 }
 
 type PrefUpdate struct {
-	PushEnabled *bool           `json:"pushEnabled"`
-	Categories  map[string]bool `json:"categories"`
+	PushEnabled     *bool           `json:"pushEnabled"`
+	EmailEnabled    *bool           `json:"emailEnabled"`
+	Categories      map[string]bool `json:"categories"`      // push mute per category
+	EmailCategories map[string]bool `json:"emailCategories"` // email mute per category
 }
 
 func (s *Service) UpdatePreferences(ctx context.Context, userID uuid.UUID, in PrefUpdate) (*Preferences, error) {
@@ -224,15 +233,35 @@ func (s *Service) UpdatePreferences(ctx context.Context, userID uuid.UUID, in Pr
 			v.Add("categories."+c, "unknown category")
 		}
 	}
+	for c := range in.EmailCategories {
+		if c == domain.CatCritical {
+			v.Add("emailCategories."+c, "interviews and offers cannot be muted individually; use the master switch")
+		} else if !contains(domain.MutableCategories, c) {
+			v.Add("emailCategories."+c, "unknown category")
+		}
+	}
 	if err := v.Err(); err != nil {
 		return nil, err
 	}
 	err := db.InTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if in.PushEnabled != nil {
+		if in.PushEnabled != nil || in.EmailEnabled != nil {
+			push, email := true, true
+			if err := tx.QueryRow(ctx,
+				`SELECT COALESCE((SELECT push_enabled FROM notification_settings WHERE user_id = $1), true),
+				        COALESCE((SELECT email_enabled FROM notification_settings WHERE user_id = $1), true)`, userID).
+				Scan(&push, &email); err != nil {
+				return err
+			}
+			if in.PushEnabled != nil {
+				push = *in.PushEnabled
+			}
+			if in.EmailEnabled != nil {
+				email = *in.EmailEnabled
+			}
 			if _, err := tx.Exec(ctx,
-				`INSERT INTO notification_settings (user_id, push_enabled) VALUES ($1, $2)
-				 ON CONFLICT (user_id) DO UPDATE SET push_enabled = EXCLUDED.push_enabled, updated_at = now()`,
-				userID, *in.PushEnabled); err != nil {
+				`INSERT INTO notification_settings (user_id, push_enabled, email_enabled) VALUES ($1, $2, $3)
+				 ON CONFLICT (user_id) DO UPDATE SET push_enabled = EXCLUDED.push_enabled, email_enabled = EXCLUDED.email_enabled, updated_at = now()`,
+				userID, push, email); err != nil {
 				return err
 			}
 		}
@@ -240,6 +269,13 @@ func (s *Service) UpdatePreferences(ctx context.Context, userID uuid.UUID, in Pr
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO notification_preferences (user_id, category, push) VALUES ($1, $2, $3)
 				 ON CONFLICT (user_id, category) DO UPDATE SET push = EXCLUDED.push`, userID, c, push); err != nil {
+				return err
+			}
+		}
+		for c, emailOn := range in.EmailCategories {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO notification_preferences (user_id, category, email) VALUES ($1, $2, $3)
+				 ON CONFLICT (user_id, category) DO UPDATE SET email = EXCLUDED.email`, userID, c, emailOn); err != nil {
 				return err
 			}
 		}

@@ -14,6 +14,7 @@ import (
 	"placementhub/internal/db"
 	"placementhub/internal/domain"
 	"placementhub/internal/eligibility"
+	"placementhub/internal/email"
 	"placementhub/internal/httpx"
 	"placementhub/internal/job"
 	"placementhub/internal/notify"
@@ -539,6 +540,7 @@ func (s *Service) notifyStage(ctx context.Context, tx pgx.Tx, studentID, appID u
 		if note != "" {
 			spec.Body += " " + note
 		}
+		spec.Email = &email.Content{CompanyName: company, JobRole: role, ApplicationStatus: "Shortlisted", Note: note}
 	case domain.StageInterview:
 		spec.Type = domain.NotifInterview
 		spec.Title = fmt.Sprintf("Interview: %s at %s", role, company)
@@ -546,6 +548,7 @@ func (s *Service) notifyStage(ctx context.Context, tx pgx.Tx, studentID, appID u
 		if note != "" {
 			spec.Body = note
 		}
+		spec.Email = &email.Content{CompanyName: company, JobRole: role, ApplicationStatus: "Interview", Note: note}
 	case domain.StageOffered:
 		spec.Type = domain.NotifOffer
 		spec.Title = fmt.Sprintf("Offer from %s", company)
@@ -553,10 +556,13 @@ func (s *Service) notifyStage(ctx context.Context, tx pgx.Tx, studentID, appID u
 			validUntil.In(s.loc).Format("2 Jan 2006"))
 		spec.Data["offerId"] = offerID
 		spec.DedupeKey = "offer:" + offerID.String()
+		spec.Email = &email.Content{CompanyName: company, JobRole: role, ApplicationStatus: "Offered",
+			OfferCTC: ctc, OfferValidUntil: validUntil.In(s.loc).Format("2 Jan 2006")}
 	case domain.StageRejected:
 		spec.Type = domain.NotifStageUpdate
 		spec.Title = fmt.Sprintf("Update from %s", company)
 		spec.Body = fmt.Sprintf("%s will not be moving forward with your application for %s.", company, role)
+		spec.Email = &email.Content{CompanyName: company, JobRole: role, ApplicationStatus: "Rejected"}
 	default: // Applied (reset): nothing to announce
 		return nil
 	}

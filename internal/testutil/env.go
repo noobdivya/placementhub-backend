@@ -26,6 +26,7 @@ import (
 	"placementhub/internal/auth"
 	"placementhub/internal/config"
 	"placementhub/internal/db"
+	"placementhub/internal/email"
 	"placementhub/internal/push"
 	"placementhub/internal/storage"
 
@@ -61,14 +62,15 @@ func (c *Clock) Advance(d time.Duration) {
 }
 
 type Env struct {
-	T      *testing.T
-	Ctx    context.Context
-	Pool   *pgxpool.Pool
-	App    *app.App
-	Cfg    config.Config
-	Clock  *Clock
-	Sender *push.Fake
-	Store  storage.Storage
+	T           *testing.T
+	Ctx         context.Context
+	Pool        *pgxpool.Pool
+	App         *app.App
+	Cfg         config.Config
+	Clock       *Clock
+	Sender      *push.Fake
+	EmailSender *email.Fake
+	Store       storage.Storage
 }
 
 func adminURL() string {
@@ -123,22 +125,24 @@ func NewEnv(t *testing.T) *Env {
 	cfg := config.Config{
 		Env: "test", JWTSecret: []byte("test-secret-test-secret-test-secret-0123"),
 		AccessTTL: 15 * time.Minute, RefreshTTL: 24 * time.Hour,
-		CORSOrigins: []string{"http://localhost:3000"}, Location: loc,
+		CORSOrigins: []string{"http://localhost:3000"}, FrontendURL: "https://app.test", Location: loc,
 		OfferValidity: 7 * 24 * time.Hour, MaxUploadMB: 5,
 		CookieSameSite: http.SameSiteLaxMode, RunWorkers: false,
 		VAPIDPublic: "test-public", VAPIDPrivate: "test-private", VAPIDSubject: "mailto:test@example.edu",
+		EmailReminderLeadTimes: []time.Duration{24 * time.Hour, time.Hour},
 	}
 	clock := &Clock{}
 	sender := &push.Fake{}
+	emailSender := &email.Fake{}
 	store, err := storage.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := app.New(cfg, pool, app.Options{Now: clock.Now, Sender: sender, Storage: store})
+	a, err := app.New(cfg, pool, app.Options{Now: clock.Now, Sender: sender, EmailSender: emailSender, Storage: store})
 	if err != nil {
 		t.Fatalf("app: %v", err)
 	}
-	return &Env{T: t, Ctx: ctx, Pool: pool, App: a, Cfg: cfg, Clock: clock, Sender: sender, Store: store}
+	return &Env{T: t, Ctx: ctx, Pool: pool, App: a, Cfg: cfg, Clock: clock, Sender: sender, EmailSender: emailSender, Store: store}
 }
 
 // ---- users ----------------------------------------------------------------
