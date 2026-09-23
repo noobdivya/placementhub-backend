@@ -99,7 +99,8 @@ const (
 	NotifRoundScheduled = "round_scheduled" // a round's schedule was set/updated for one candidate
 	NotifRoundCleared   = "round_cleared"
 	NotifRoundRejected  = "round_rejected"
-	NotifRoundUpdated   = "round_updated" // logistics of an already-scheduled round changed for everyone in it
+	NotifRoundUpdated   = "round_updated"  // logistics of an already-scheduled round changed for everyone in it
+	NotifRoundReminder  = "round_reminder" // an already-Scheduled round starts soon
 )
 
 // Categories are what students see in their mute settings.
@@ -131,7 +132,7 @@ func CategoryFor(notifType string) string {
 	case NotifNotice:
 		return CatNotices
 	default: // interview, offer, offer_expiring, offer_expired, placement,
-		// round_scheduled, round_cleared, round_rejected, round_updated
+		// round_scheduled, round_cleared, round_rejected, round_updated, round_reminder
 		return CatCritical
 	}
 }

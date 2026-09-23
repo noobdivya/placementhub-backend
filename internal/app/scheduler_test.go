@@ -193,6 +193,93 @@ func TestSchedulerRunsOnOneInstanceAtATime(t *testing.T) {
 	}
 }
 
+// TestRoundReminderEmailsFireAtConfiguredLeadTimes walks the fake clock across
+// both configured lead-time boundaries (24h, 1h — internal/testutil.NewEnv's
+// test config) for one Scheduled round, mirroring the deadline-reminder
+// test's windowed/idempotent style, then confirms a reschedule re-opens
+// eligibility for the new time instead of staying suppressed.
+func TestRoundReminderEmailsFireAtConfiguredLeadTimes(t *testing.T) {
+	w := newWorld(t)
+	e := w.e
+	id := w.postJobWithRound("Aptitude Test")
+	e.Post(w.company, "/company/jobs/"+id+"/submit", nil)
+	w.approve(id)
+
+	s := e.Student(testutil.StudentOpts{Roll: "21CS060"})
+	appID := w.mustApply(s, uuid.MustParse(id))
+	roundID := e.Get(w.company, "/company/jobs/"+id+"/rounds").Items()[0]["id"].(string)
+
+	setSchedule := func(at time.Time) {
+		w.e.T.Helper()
+		e.Relogin(w.company) // the clock may have advanced past the access token's TTL
+		r := e.Req(w.company, "PUT", "/company/jobs/"+id+"/rounds", map[string]any{"items": []map[string]any{
+			{"id": roundID, "name": "Aptitude Test", "mode": "Online", "durationMinutes": 60, "scheduledAt": at.UTC().Format(time.RFC3339)},
+		}})
+		if r.Status != 200 {
+			w.e.T.Fatalf("set schedule: %d %s", r.Status, r.Body)
+		}
+	}
+	scheduledAt := e.Clock.Now().Add(5 * 24 * time.Hour)
+	setSchedule(scheduledAt)
+	if r := e.Req(w.company, "PATCH", "/company/applications/"+appID+"/rounds/"+roundID, map[string]any{"status": "Scheduled"}); r.Status != 200 {
+		t.Fatalf("mark scheduled: %d %s", r.Status, r.Body)
+	}
+
+	remindersOf := func(lead string) int {
+		return e.Count(`SELECT count(*) FROM notifications WHERE user_id = $1 AND dedupe_key LIKE $2`, s.ID, "round_reminder_"+lead+":%")
+	}
+
+	// Well outside every window: nothing.
+	w.advanceTo(scheduledAt, 4*24*time.Hour)
+	w.runScheduler()
+	if remindersOf("24h") != 0 || remindersOf("1h") != 0 {
+		t.Fatal("reminder sent 4 days out")
+	}
+
+	// Inside the 24h window: exactly one 24h reminder, idempotent on re-ticks.
+	w.advanceTo(scheduledAt, 23*time.Hour)
+	w.runScheduler()
+	w.runScheduler()
+	if remindersOf("24h") != 1 {
+		t.Errorf("24h reminders = %d, want 1", remindersOf("24h"))
+	}
+	if remindersOf("1h") != 0 {
+		t.Errorf("1h reminder fired early")
+	}
+	subj, _, _, to := emailFor(t, e, s, "round_reminder")
+	if subj != "Reminder: Aptitude Test Starts Soon – Nimbus Labs" || to != s.Email {
+		t.Errorf("round reminder email = %q / %q", subj, to)
+	}
+
+	// Inside the 1h window: a second, distinct reminder.
+	w.advanceTo(scheduledAt, 30*time.Minute)
+	w.runScheduler()
+	if remindersOf("1h") != 1 {
+		t.Errorf("1h reminders = %d, want 1", remindersOf("1h"))
+	}
+	if n := emailCount(e, s, "round_reminder"); n != 2 {
+		t.Errorf("round_reminder emails = %d, want 2 (24h + 1h)", n)
+	}
+
+	// After the round starts: no further reminders even on repeated ticks.
+	e.Clock.Advance(2 * time.Hour)
+	w.runScheduler()
+	if n := emailCount(e, s, "round_reminder"); n != 2 {
+		t.Errorf("reminder fired after the round started (%d)", n)
+	}
+
+	// Rescheduling bumps job_rounds.version, re-opening reminder eligibility
+	// for the new time rather than staying suppressed by the reminder already
+	// sent for the old one.
+	newTime := e.Clock.Now().Add(30 * time.Hour)
+	setSchedule(newTime)
+	w.advanceTo(newTime, 23*time.Hour)
+	w.runScheduler()
+	if n := emailCount(e, s, "round_reminder"); n != 3 {
+		t.Errorf("reschedule did not re-open reminder eligibility (%d)", n)
+	}
+}
+
 func TestSchedulerCleansUpStaleRows(t *testing.T) {
 	w := newWorld(t)
 	e := w.e

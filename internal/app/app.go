@@ -13,6 +13,7 @@ import (
 	"placementhub/internal/config"
 	"placementhub/internal/domain"
 	"placementhub/internal/drive"
+	"placementhub/internal/email"
 	"placementhub/internal/httpx"
 	"placementhub/internal/job"
 	"placementhub/internal/notice"
@@ -29,11 +30,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Options lets tests swap the clock, the push transport and file storage.
+// Options lets tests swap the clock, the push/email transports and file storage.
 type Options struct {
-	Now     func() time.Time
-	Sender  push.Sender
-	Storage storage.Storage
+	Now         func() time.Time
+	Sender      push.Sender
+	EmailSender email.Sender
+	Storage     storage.Storage
 }
 
 type App struct {
@@ -47,6 +49,7 @@ type App struct {
 	Students  *student.Service
 	Reports   *report.Service
 	Push      *push.Worker
+	Email     *email.Worker
 	Scheduler *scheduler.Scheduler
 }
 
@@ -67,8 +70,12 @@ func New(cfg config.Config, pool *pgxpool.Pool, opts Options) (*App, error) {
 	if sender == nil && cfg.PushEnabled() {
 		sender = push.NewWebPush(cfg.VAPIDPublic, cfg.VAPIDPrivate, cfg.VAPIDSubject)
 	}
+	emailSender := opts.EmailSender
+	if emailSender == nil && cfg.EmailEnabled() {
+		emailSender = email.NewResend(cfg.ResendAPIKey, cfg.EmailFrom)
+	}
 
-	notifier := notify.New(cfg.PushEnabled() || opts.Sender != nil)
+	notifier := notify.New(cfg.PushEnabled() || opts.Sender != nil, cfg.EmailEnabled() || opts.EmailSender != nil, cfg.FrontendURL)
 	authSvc := auth.NewService(pool, cfg)
 	authSvc.Now = now
 	studentSvc := student.NewService(pool, store, cfg.MaxUploadBytes())
@@ -85,7 +92,7 @@ func New(cfg config.Config, pool *pgxpool.Pool, opts Options) (*App, error) {
 	siteSvc := site.NewService(pool)
 	reportSvc := report.NewService(pool, cfg)
 	reportSvc.Now = now
-	notifySvc := notify.NewService(pool, cfg.PushEnabled() || opts.Sender != nil)
+	notifySvc := notify.NewService(pool, cfg.PushEnabled() || opts.Sender != nil, cfg.EmailEnabled() || opts.EmailSender != nil)
 
 	a := &App{Cfg: cfg, Pool: pool, Auth: authSvc, Jobs: jobSvc, Apps: appSvc, Drives: driveSvc,
 		Students: studentSvc, Reports: reportSvc}
@@ -93,7 +100,11 @@ func New(cfg config.Config, pool *pgxpool.Pool, opts Options) (*App, error) {
 		a.Push = push.NewWorker(pool, sender)
 		a.Push.Now = now
 	}
-	a.Scheduler = scheduler.New(pool, jobSvc, appSvc, driveSvc)
+	if emailSender != nil {
+		a.Email = email.NewWorker(pool, emailSender)
+		a.Email.Now = now
+	}
+	a.Scheduler = scheduler.New(pool, jobSvc, appSvc, driveSvc, roundSvc)
 	a.Scheduler.Now = now
 
 	authH := auth.NewHandler(authSvc, cfg)
@@ -228,6 +239,11 @@ func (a *App) StartWorkers(ctx context.Context) {
 		go a.Push.Run(ctx)
 	} else {
 		slog.Warn("web push is not configured (set VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY); browser notifications are disabled")
+	}
+	if a.Email != nil {
+		go a.Email.Run(ctx)
+	} else {
+		slog.Warn("email is not configured (set RESEND_API_KEY / EMAIL_FROM); email notifications are disabled")
 	}
 	go a.Scheduler.Run(ctx)
 }

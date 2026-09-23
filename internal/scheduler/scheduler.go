@@ -12,8 +12,10 @@ import (
 
 	"placementhub/internal/application"
 	"placementhub/internal/drive"
+	"placementhub/internal/email"
 	"placementhub/internal/job"
 	"placementhub/internal/push"
+	"placementhub/internal/round"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -25,11 +27,12 @@ type Scheduler struct {
 	jobs   *job.Service
 	apps   *application.Service
 	drives *drive.Service
+	rounds *round.Service
 	Now    func() time.Time
 }
 
-func New(pool *pgxpool.Pool, jobs *job.Service, apps *application.Service, drives *drive.Service) *Scheduler {
-	return &Scheduler{pool: pool, jobs: jobs, apps: apps, drives: drives, Now: time.Now}
+func New(pool *pgxpool.Pool, jobs *job.Service, apps *application.Service, drives *drive.Service, rounds *round.Service) *Scheduler {
+	return &Scheduler{pool: pool, jobs: jobs, apps: apps, drives: drives, rounds: rounds, Now: time.Now}
 }
 
 // Result reports what one tick did.
@@ -40,6 +43,7 @@ type Result struct {
 	OffersExpired     int
 	OfferReminders    int
 	DriveReminders    int64
+	RoundReminders    int64
 	Cleaned           int64
 }
 
@@ -99,6 +103,8 @@ func (s *Scheduler) RunOnce(ctx context.Context) (Result, error) {
 	note("offer_reminders", err2)
 	res.DriveReminders, err2 = s.drives.SendReminders(ctx)
 	note("drive_reminders", err2)
+	res.RoundReminders, err2 = s.rounds.SendReminders(ctx)
+	note("round_reminders", err2)
 	res.Cleaned, err2 = s.cleanup(ctx)
 	note("cleanup", err2)
 
@@ -123,5 +129,10 @@ func (s *Scheduler) cleanup(ctx context.Context) (int64, error) {
 	}
 	total += tag.RowsAffected()
 	n, err := push.Cleanup(ctx, s.pool, now.Add(-7*24*time.Hour))
+	if err != nil {
+		return total, err
+	}
+	total += n
+	n, err = email.Cleanup(ctx, s.pool, now.Add(-7*24*time.Hour))
 	return total + n, err
 }

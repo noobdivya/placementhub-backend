@@ -33,6 +33,10 @@ type Config struct {
 	VAPIDPrivate string
 	VAPIDSubject string
 
+	ResendAPIKey           string
+	EmailFrom              string
+	EmailReminderLeadTimes []time.Duration
+
 	BootstrapAdminEmail    string
 	BootstrapAdminPassword string
 	BootstrapAdminName     string
@@ -42,6 +46,7 @@ type Config struct {
 
 func (c Config) IsProd() bool          { return c.Env == "production" }
 func (c Config) PushEnabled() bool     { return c.VAPIDPublic != "" && c.VAPIDPrivate != "" }
+func (c Config) EmailEnabled() bool    { return c.ResendAPIKey != "" && c.EmailFrom != "" }
 func (c Config) MaxUploadBytes() int64 { return c.MaxUploadMB << 20 }
 
 func Load() (Config, error) {
@@ -55,6 +60,9 @@ func Load() (Config, error) {
 		VAPIDPublic:  os.Getenv("VAPID_PUBLIC_KEY"),
 		VAPIDPrivate: os.Getenv("VAPID_PRIVATE_KEY"),
 		VAPIDSubject: get("VAPID_SUBJECT", "mailto:placements@example.edu"),
+
+		ResendAPIKey: os.Getenv("RESEND_API_KEY"),
+		EmailFrom:    os.Getenv("EMAIL_FROM"),
 
 		BootstrapAdminEmail:    strings.ToLower(strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_EMAIL"))),
 		BootstrapAdminPassword: os.Getenv("BOOTSTRAP_ADMIN_PASSWORD"),
@@ -72,6 +80,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.RefreshTTL, err = duration("REFRESH_TOKEN_TTL", 14*24*time.Hour); err != nil {
+		return c, err
+	}
+	if c.EmailReminderLeadTimes, err = durationList("EMAIL_ROUND_REMINDER_LEAD_TIMES", []time.Duration{24 * time.Hour, time.Hour}); err != nil {
 		return c, err
 	}
 	days, err := intVar("OFFER_VALIDITY_DAYS", 7)
@@ -136,6 +147,9 @@ func (c Config) validate() error {
 	if (c.VAPIDPublic == "") != (c.VAPIDPrivate == "") {
 		errs = append(errs, errors.New("VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY must be set together"))
 	}
+	if (c.ResendAPIKey == "") != (c.EmailFrom == "") {
+		errs = append(errs, errors.New("RESEND_API_KEY and EMAIL_FROM must be set together"))
+	}
 	if c.BootstrapAdminEmail != "" && len(c.BootstrapAdminPassword) < 10 {
 		errs = append(errs, errors.New("BOOTSTRAP_ADMIN_PASSWORD must be at least 10 characters"))
 	}
@@ -159,6 +173,30 @@ func duration(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}
 	return d, nil
+}
+
+// durationList parses a comma-separated list of durations (e.g. "24h,1h"),
+// trimming whitespace around each token and skipping empty ones — the same
+// shape as CORS_ALLOWED_ORIGINS's comma-split, adapted for durations instead
+// of URLs.
+func durationList(key string, def []time.Duration) ([]time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	var out []time.Duration
+	for _, tok := range strings.Split(v, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		d, err := time.ParseDuration(tok)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		out = append(out, d)
+	}
+	return out, nil
 }
 
 func intVar(key string, def int) (int, error) {

@@ -164,7 +164,7 @@ paths:
     get: {tags: [Notifications], summary: "Master switch, per-category mutes, device count", responses: {"200": {description: Preferences, content: {application/json: {schema: {$ref: "#/components/schemas/Preferences"}}}}}}
     put:
       tags: [Notifications]
-      summary: 'Mute/unmute. Body `{"pushEnabled"?: bool, "categories"?: {"new_job": false}}`. `critical` cannot be muted individually.'
+      summary: 'Mute/unmute. Body `{"pushEnabled"?: bool, "emailEnabled"?: bool, "categories"?: {"new_job": false}, "emailCategories"?: {"new_job": false}}`. `critical` cannot be muted individually.'
       responses: {"200": {description: Preferences}, "422": {$ref: "#/components/responses/Error"}}
   /me/notifications:
     get:
@@ -503,7 +503,9 @@ components:
       properties:
         pushAvailable: {type: boolean}
         pushEnabled: {type: boolean}
+        emailAvailable: {type: boolean, description: "server has RESEND_API_KEY/EMAIL_FROM configured"}
+        emailEnabled: {type: boolean, description: "master switch for email delivery"}
         devices: {type: integer}
         categories:
           type: array
-          items: {type: object, properties: {category: {type: string, enum: [new_job, application_update, deadline, drive, notice, critical]}, label: {type: string}, push: {type: boolean}, mutable: {type: boolean}}}
+          items: {type: object, properties: {category: {type: string, enum: [new_job, application_update, deadline, drive, notice, critical]}, label: {type: string}, push: {type: boolean}, email: {type: boolean}, mutable: {type: boolean}}}

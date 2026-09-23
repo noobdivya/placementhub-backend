@@ -8,6 +8,7 @@ import (
 	"placementhub/internal/audit"
 	"placementhub/internal/db"
 	"placementhub/internal/domain"
+	"placementhub/internal/email"
 	"placementhub/internal/httpx"
 	"placementhub/internal/notify"
 
@@ -206,6 +207,7 @@ func (s *Service) Accept(ctx context.Context, userID, offerID uuid.UUID) (*Accep
 			Link:      "/students/applications",
 			Data:      map[string]any{"offerId": offerID},
 			DedupeKey: "placement:" + offerID.String(),
+			Email:     &email.Content{CompanyName: company, JobRole: role, ApplicationStatus: "Placed"},
 		})
 		return err
 	})

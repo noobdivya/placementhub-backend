@@ -1,6 +1,7 @@
 package round
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	"placementhub/internal/config"
 	"placementhub/internal/db"
 	"placementhub/internal/domain"
+	"placementhub/internal/email"
 	"placementhub/internal/httpx"
 	"placementhub/internal/notify"
 
@@ -19,14 +21,15 @@ import (
 )
 
 type Service struct {
-	pool     *pgxpool.Pool
-	notifier *notify.Notifier
-	loc      *time.Location
-	Now      func() time.Time
+	pool      *pgxpool.Pool
+	notifier  *notify.Notifier
+	loc       *time.Location
+	Now       func() time.Time
+	LeadTimes []time.Duration // configured reminder lead times, e.g. 24h/1h before a Scheduled round
 }
 
 func NewService(pool *pgxpool.Pool, n *notify.Notifier, cfg config.Config) *Service {
-	return &Service{pool: pool, notifier: n, loc: cfg.Location, Now: time.Now}
+	return &Service{pool: pool, notifier: n, loc: cfg.Location, Now: time.Now, LeadTimes: cfg.EmailReminderLeadTimes}
 }
 
 const roundCols = `id, seq, name, mode, scheduled_at, duration_minutes, location, instructions`
@@ -361,17 +364,22 @@ func (s *Service) SetStatus(ctx context.Context, userID, appID, roundID uuid.UUI
 		jobID                           uuid.UUID
 		stage, company, role, roundName string
 		roundSeq                        int
+		mode, location, instructions    string
+		scheduledAt                     *time.Time
+		durationMinutes                 int
 	)
 	err := db.InTx(ctx, s.pool, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `
-			SELECT a.student_id, j.id, a.stage, c.name, j.role, jr.name, jr.seq
+			SELECT a.student_id, j.id, a.stage, c.name, j.role, jr.name, jr.seq,
+			       jr.mode, jr.scheduled_at, jr.duration_minutes, jr.location, jr.instructions
 			  FROM applications a
 			  JOIN jobs j ON j.id = a.job_id
 			  JOIN companies c ON c.id = j.company_id
 			  JOIN job_rounds jr ON jr.job_id = j.id AND jr.id = $3
 			 WHERE a.id = $1 AND c.user_id = $2
 			 FOR UPDATE OF a`, appID, userID, roundID).
-			Scan(&studentID, &jobID, &stage, &company, &role, &roundName, &roundSeq)
+			Scan(&studentID, &jobID, &stage, &company, &role, &roundName, &roundSeq,
+				&mode, &scheduledAt, &durationMinutes, &location, &instructions)
 		if err != nil {
 			if db.IsNoRows(err) {
 				return httpx.NotFound("application") // covers "not your job" and "no such round on this job" alike
@@ -412,7 +420,8 @@ func (s *Service) SetStatus(ctx context.Context, userID, appID, roundID uuid.UUI
 			return err
 		}
 
-		return s.notifyRoundStatus(ctx, tx, studentID, jobID, appID, roundID, version, in.Status, company, role, roundName, roundSeq, in.Note)
+		return s.notifyRoundStatus(ctx, tx, studentID, jobID, appID, roundID, version, in.Status, company, role, roundName, roundSeq, in.Note,
+			mode, location, instructions, scheduledAt, durationMinutes)
 	})
 	if err != nil {
 		return nil, err
@@ -432,18 +441,22 @@ func (s *Service) SetStatus(ctx context.Context, userID, appID, roundID uuid.UUI
 // ---- notifications ----------------------------------------------------------
 
 func (s *Service) notifyRoundStatus(ctx context.Context, tx pgx.Tx, studentID, jobID, appID, roundID uuid.UUID,
-	version int, status, company, role, roundName string, roundSeq int, note string) error {
+	version int, status, company, role, roundName string, roundSeq int, note string,
+	mode, location, instructions string, scheduledAt *time.Time, durationMinutes int) error {
 
 	spec := notify.Spec{
 		Link:      "/students/applications",
 		Data:      map[string]any{"applicationId": appID, "roundId": roundID, "status": status},
 		DedupeKey: fmt.Sprintf("round_status:%s:%d", roundID, version),
 	}
+	when := roundWhen(scheduledAt, s.loc)
 	switch status {
 	case domain.RoundScheduled:
 		spec.Type = domain.NotifRoundScheduled
 		spec.Title = fmt.Sprintf("%s scheduled: %s at %s", roundName, role, company)
 		spec.Body = "Check your application for the date, time and details."
+		spec.Email = &email.Content{CompanyName: company, JobRole: role, RoundName: roundName,
+			When: when, Mode: mode, Location: location, DurationMinutes: durationMinutes, Instructions: instructions, Note: note}
 	case domain.RoundCleared:
 		spec.Type = domain.NotifRoundCleared
 		spec.Title = fmt.Sprintf("Cleared: %s", roundName)
@@ -457,10 +470,14 @@ func (s *Service) notifyRoundStatus(ctx context.Context, tx pgx.Tx, studentID, j
 		default:
 			spec.Body = fmt.Sprintf("You've cleared the %s for %s at %s. Next: %s.", roundName, role, company, nextName)
 		}
+		spec.Email = &email.Content{CompanyName: company, JobRole: role, RoundName: roundName,
+			ApplicationStatus: "Cleared", NextRoundName: nextName, Note: note}
 	case domain.RoundRejected:
 		spec.Type = domain.NotifRoundRejected
 		spec.Title = fmt.Sprintf("Update on %s at %s", role, company)
 		spec.Body = fmt.Sprintf("%s will not be moving you forward from the %s.", company, roundName)
+		spec.Email = &email.Content{CompanyName: company, JobRole: role, RoundName: roundName,
+			ApplicationStatus: "Rejected", Note: note}
 	default: // Upcoming: nothing to announce
 		return nil
 	}
@@ -475,25 +492,31 @@ func (s *Service) notifyRoundStatus(ctx context.Context, tx pgx.Tx, studentID, j
 	return err
 }
 
+// roundWhen formats a round's schedule for both push body and email content;
+// "" means not yet scheduled (each renders its own "to be announced" wording).
+func roundWhen(scheduledAt *time.Time, loc *time.Location) string {
+	if scheduledAt == nil {
+		return ""
+	}
+	t := scheduledAt.In(loc)
+	return fmt.Sprintf("%s at %s", t.Format("2 Jan"), t.Format("3:04 PM"))
+}
+
 // notifyReschedule tells every candidate already tracked against a
 // (now-locked) round that its logistics changed.
 func (s *Service) notifyReschedule(ctx context.Context, tx pgx.Tx, roundID uuid.UUID) error {
-	var name string
-	var mode, location string
+	var name, mode, location, role, company, instructions string
 	var scheduledAt *time.Time
-	if err := tx.QueryRow(ctx, `SELECT name, mode, scheduled_at, location FROM job_rounds WHERE id = $1`, roundID).
-		Scan(&name, &mode, &scheduledAt, &location); err != nil {
+	var durationMinutes, version int
+	if err := tx.QueryRow(ctx, `
+		SELECT jr.name, jr.mode, jr.scheduled_at, jr.location, jr.duration_minutes, jr.instructions, jr.version, j.role, c.name
+		  FROM job_rounds jr JOIN jobs j ON j.id = jr.job_id JOIN companies c ON c.id = j.company_id
+		 WHERE jr.id = $1`, roundID).
+		Scan(&name, &mode, &scheduledAt, &location, &durationMinutes, &instructions, &version, &role, &company); err != nil {
 		return err
 	}
-	var version int
-	if err := tx.QueryRow(ctx, `SELECT version FROM job_rounds WHERE id = $1`, roundID).Scan(&version); err != nil {
-		return err
-	}
-	when := "a date to be announced"
-	if scheduledAt != nil {
-		t := scheduledAt.In(s.loc)
-		when = fmt.Sprintf("%s at %s", t.Format("2 Jan"), t.Format("3:04 PM"))
-	}
+	when := roundWhen(scheduledAt, s.loc)
+	body := fmt.Sprintf("Now %s · %s%s", cmp.Or(when, "a date to be announced"), mode, mapNonEmpty(location))
 	_, err := s.notifier.ToUsers(ctx, tx, `
 		SELECT DISTINCT st.user_id FROM application_round_status ars
 		  JOIN applications a ON a.id = ars.application_id
@@ -501,9 +524,11 @@ func (s *Service) notifyReschedule(ctx context.Context, tx pgx.Tx, roundID uuid.
 		 WHERE ars.round_id = $1`, []any{roundID}, notify.Spec{
 		Type:      domain.NotifRoundUpdated,
 		Title:     fmt.Sprintf("Round updated: %s", name),
-		Body:      fmt.Sprintf("Now %s · %s%s", when, mode, mapNonEmpty(location)),
+		Body:      body,
 		Link:      "/students/applications",
 		DedupeKey: fmt.Sprintf("round_update:%s:%d", roundID, version),
+		Email: &email.Content{CompanyName: company, JobRole: role, RoundName: name,
+			When: when, Mode: mode, Location: location, DurationMinutes: durationMinutes, Instructions: instructions},
 	})
 	return err
 }
@@ -519,4 +544,95 @@ func userIDFor(ctx context.Context, q db.DBTX, studentID uuid.UUID) (uuid.UUID, 
 	var id uuid.UUID
 	err := q.QueryRow(ctx, `SELECT user_id FROM students WHERE id = $1`, studentID).Scan(&id)
 	return id, err
+}
+
+// ---- scheduler hook ---------------------------------------------------------
+
+type reminderCandidate struct {
+	userID                        uuid.UUID
+	roundID                       uuid.UUID
+	appID                         uuid.UUID
+	roundName, company, role      string
+	mode, location, instructions  string
+	scheduledAt                   *time.Time
+	durationMinutes, roundVersion int
+}
+
+// SendReminders notifies every candidate with a Scheduled round starting
+// within one of s.LeadTimes. It follows job.Service.SendDeadlineReminders's
+// windowed, dedupe-keyed approach exactly: a lead time only fires once the
+// round has crossed into its window (scheduled_at - lead <= now) and hasn't
+// happened yet (scheduled_at > now); the third clause guards against sending
+// a reminder the instant a round is scheduled/rescheduled to a time that's
+// already inside the window (mirroring SendDeadlineReminders's j.approved_at
+// check). The dedupe key uses job_rounds.version (bumped on reschedule), not
+// application_round_status's, so rescheduling re-opens reminder eligibility
+// for the new time instead of being permanently suppressed by a reminder
+// already sent for the old one.
+func (s *Service) SendReminders(ctx context.Context) (int64, error) {
+	var total int64
+	now := s.Now()
+	for _, lead := range s.LeadTimes {
+		rows, err := s.pool.Query(ctx, `
+			SELECT st.user_id, jr.id, a.id, jr.name, c.name, j.role,
+			       jr.mode, jr.location, jr.instructions, jr.scheduled_at, jr.duration_minutes, jr.version
+			  FROM application_round_status ars
+			  JOIN job_rounds jr ON jr.id = ars.round_id
+			  JOIN applications a ON a.id = ars.application_id
+			  JOIN jobs j ON j.id = a.job_id
+			  JOIN companies c ON c.id = j.company_id
+			  JOIN students st ON st.id = a.student_id
+			 WHERE ars.status = 'Scheduled'
+			   AND jr.scheduled_at IS NOT NULL
+			   AND jr.scheduled_at - make_interval(secs => $1) <= $2
+			   AND jr.scheduled_at > $2
+			   AND GREATEST(ars.updated_at, jr.updated_at) <= jr.scheduled_at - make_interval(secs => $1)`,
+			lead.Seconds(), now)
+		if err != nil {
+			return total, err
+		}
+		var cands []reminderCandidate
+		for rows.Next() {
+			var c reminderCandidate
+			if err := rows.Scan(&c.userID, &c.roundID, &c.appID, &c.roundName, &c.company, &c.role,
+				&c.mode, &c.location, &c.instructions, &c.scheduledAt, &c.durationMinutes, &c.roundVersion); err != nil {
+				rows.Close()
+				return total, err
+			}
+			cands = append(cands, c)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return total, err
+		}
+
+		for _, c := range cands {
+			when := roundWhen(c.scheduledAt, s.loc)
+			ok, err := s.notifier.ToUser(ctx, s.pool, c.userID, notify.Spec{
+				Type:      domain.NotifRoundReminder,
+				Title:     fmt.Sprintf("Reminder: %s at %s", c.roundName, c.company),
+				Body:      fmt.Sprintf("%s starts %s.", c.roundName, when),
+				Link:      "/students/applications",
+				Data:      map[string]any{"applicationId": c.appID, "roundId": c.roundID},
+				DedupeKey: fmt.Sprintf("round_reminder_%s:%s:%d", leadLabel(lead), c.roundID, c.roundVersion),
+				Email: &email.Content{CompanyName: c.company, JobRole: c.role, RoundName: c.roundName,
+					When: when, Mode: c.mode, Location: c.location, DurationMinutes: c.durationMinutes, Instructions: c.instructions},
+			})
+			if err != nil {
+				return total, err
+			}
+			if ok {
+				total++
+			}
+		}
+	}
+	return total, nil
+}
+
+// leadLabel turns a lead time into a short, stable dedupe-key token.
+func leadLabel(d time.Duration) string {
+	if d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int64(d/time.Hour))
+	}
+	return fmt.Sprintf("%dm", int64(d/time.Minute))
 }
