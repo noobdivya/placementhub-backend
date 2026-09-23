@@ -19,6 +19,7 @@ import (
 	"placementhub/internal/notify"
 	"placementhub/internal/push"
 	"placementhub/internal/report"
+	"placementhub/internal/round"
 	"placementhub/internal/scheduler"
 	"placementhub/internal/site"
 	"placementhub/internal/storage"
@@ -78,6 +79,8 @@ func New(cfg config.Config, pool *pgxpool.Pool, opts Options) (*App, error) {
 	appSvc.Now = now
 	driveSvc := drive.NewService(pool, notifier, cfg)
 	driveSvc.Now = now
+	roundSvc := round.NewService(pool, notifier, cfg)
+	roundSvc.Now = now
 	noticeSvc := notice.NewService(pool, notifier, cfg)
 	siteSvc := site.NewService(pool)
 	reportSvc := report.NewService(pool, cfg)
@@ -99,6 +102,7 @@ func New(cfg config.Config, pool *pgxpool.Pool, opts Options) (*App, error) {
 	jobH := job.NewHandler(jobSvc, cfg)
 	appH := application.NewHandler(appSvc, studentSvc, cfg)
 	driveH := drive.NewHandler(driveSvc, cfg)
+	roundH := round.NewHandler(roundSvc, cfg)
 	noticeH := notice.NewHandler(noticeSvc, cfg)
 	siteH := site.NewHandler(siteSvc, cfg)
 	reportH := report.NewHandler(reportSvc)
@@ -142,6 +146,7 @@ func New(cfg config.Config, pool *pgxpool.Pool, opts Options) (*App, error) {
 				r.Use(auth.RequireRole(domain.RoleStudent))
 				studentH.StudentRoutes(r)
 				appH.MeRoutes(r)
+				roundH.MeRoutes(r)
 				notifyH.StudentRoutes(r)
 			})
 		})
@@ -149,14 +154,19 @@ func New(cfg config.Config, pool *pgxpool.Pool, opts Options) (*App, error) {
 			r.Use(auth.RequireRole(domain.RoleStudent))
 			jobH.StudentRoutes(r)
 			appH.JobRoutes(r)
+			roundH.StudentJobRoutes(r)
 		})
 		r.With(auth.RequireRole(domain.RoleStudent)).Route("/drives", driveH.StudentRoutes)
 
 		r.Route("/company", func(r chi.Router) {
 			r.Use(auth.RequireRole(domain.RoleCompany))
 			companyH.CompanyRoutes(r)
-			r.Route("/jobs", jobH.CompanyRoutes)
+			r.Route("/jobs", func(r chi.Router) {
+				jobH.CompanyRoutes(r)
+				roundH.CompanyJobRoutes(r)
+			})
 			appH.CompanyRoutes(r)
+			roundH.CompanyRoutes(r)
 		})
 
 		r.Route("/admin", func(r chi.Router) {

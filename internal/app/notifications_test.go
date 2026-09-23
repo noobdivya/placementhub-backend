@@ -26,13 +26,17 @@ func (w *world) placeStudent(s *testutil.User) {
 func (w *world) postAndApproveJob(over map[string]any) string {
 	w.e.T.Helper()
 	deadline := w.e.Clock.Now().In(w.e.Cfg.Location).AddDate(0, 0, 15).Format("2006-01-02")
-	body := jobBody(deadline, over)
-	body["submit"] = true
-	r := w.e.Post(w.company, "/company/jobs", body)
-	if r.Status != http.StatusCreated || r.JSON()["status"] != "Pending" {
-		w.e.T.Fatalf("post job: %d %s", r.Status, r.Body)
+	created := w.e.Post(w.company, "/company/jobs", jobBody(deadline, over))
+	if created.Status != http.StatusCreated {
+		w.e.T.Fatalf("post job: %d %s", created.Status, created.Body)
 	}
-	return r.JSON()["id"].(string)
+	id := created.JSON()["id"].(string)
+	w.defineRound(id)
+	r := w.e.Post(w.company, "/company/jobs/"+id+"/submit", nil)
+	if r.Status != http.StatusOK || r.JSON()["status"] != "Pending" {
+		w.e.T.Fatalf("submit job: %d %s", r.Status, r.Body)
+	}
+	return id
 }
 
 func (w *world) approve(jobID string) map[string]any {

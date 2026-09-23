@@ -360,6 +360,11 @@ func TestCompanyRegistrationStartsPendingAndCannotSubmitJobs(t *testing.T) {
 	if r := e.Req(admin, "PATCH", "/admin/companies/"+companyID+"/status", map[string]any{"status": "Approved"}); r.Status != 200 {
 		t.Fatalf("approve company: %d %s", r.Status, r.Body)
 	}
+	if r := e.Req(co, "PUT", "/company/jobs/"+id+"/rounds", map[string]any{
+		"items": []map[string]any{{"name": "Technical Interview", "mode": "Online", "durationMinutes": 45}},
+	}); r.Status != 200 {
+		t.Fatalf("define round: %d %s", r.Status, r.Body)
+	}
 	if r := e.Post(co, "/company/jobs/"+id+"/submit", nil); r.Status != 200 || r.JSON()["status"] != "Pending" {
 		t.Fatalf("submit after approval: %d %s", r.Status, r.Body)
 	}

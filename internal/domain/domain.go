@@ -65,6 +65,20 @@ var JobTypes = []string{"Full-time", "Internship"}
 var DriveModes = []string{"On-campus", "Virtual", "Off-campus"}
 var NoticeTags = []string{"Result", "Drive", "Alert", "Event", "General"}
 
+var RoundModes = []string{"Online", "Offline"}
+
+// Selection-round statuses, tracked per (application, round). A row only
+// exists once a recruiter has moved a candidate off the implicit default of
+// Upcoming — see internal/round.
+const (
+	RoundUpcoming  = "Upcoming"
+	RoundScheduled = "Scheduled"
+	RoundCleared   = "Cleared"
+	RoundRejected  = "Rejected"
+)
+
+var RoundStatuses = []string{RoundUpcoming, RoundScheduled, RoundCleared, RoundRejected}
+
 // Notification types. Each maps to a category the student can mute.
 const (
 	NotifNewJob         = "new_job"
@@ -79,6 +93,13 @@ const (
 	NotifDriveReminder  = "drive_reminder"
 	NotifNotice         = "notice"
 	NotifPlacementFinal = "placement"
+
+	// Selection-round events. Every one of these is as time-sensitive as an
+	// interview or offer, so CategoryFor maps them to CatCritical below.
+	NotifRoundScheduled = "round_scheduled" // a round's schedule was set/updated for one candidate
+	NotifRoundCleared   = "round_cleared"
+	NotifRoundRejected  = "round_rejected"
+	NotifRoundUpdated   = "round_updated" // logistics of an already-scheduled round changed for everyone in it
 )
 
 // Categories are what students see in their mute settings.
@@ -109,7 +130,8 @@ func CategoryFor(notifType string) string {
 		return CatDrives
 	case NotifNotice:
 		return CatNotices
-	default: // interview, offer, offer_expiring, offer_expired, placement
+	default: // interview, offer, offer_expiring, offer_expired, placement,
+		// round_scheduled, round_cleared, round_rejected, round_updated
 		return CatCritical
 	}
 }

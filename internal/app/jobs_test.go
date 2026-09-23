@@ -182,6 +182,10 @@ func TestJobLifecycleDraftSubmitApproveReject(t *testing.T) {
 	if r := e.Req(w.company, "PUT", "/company/jobs/"+id, jobBody(deadline, map[string]any{"ctc": 18, "minCgpa": 8})); r.Status != 200 || r.JSON()["ctc"].(float64) != 18 {
 		t.Fatalf("edit draft: %d %s", r.Status, r.Body)
 	}
+	if r := e.Post(w.company, "/company/jobs/"+id+"/submit", nil); r.Status != 422 || r.ErrCode() != "rounds_required" {
+		t.Fatalf("submit without rounds: %d %s", r.Status, r.Body)
+	}
+	w.defineRound(id)
 	if r := e.Post(w.company, "/company/jobs/"+id+"/submit", nil); r.Status != 200 || r.JSON()["status"] != "Pending" {
 		t.Fatalf("submit: %d %s", r.Status, r.Body)
 	}

@@ -302,6 +302,13 @@ func (s *Service) Submit(ctx context.Context, userID, id uuid.UUID) (*Job, error
 			return httpx.Unprocessable("company_not_approved",
 				"your company must be approved by the placement cell before you can submit jobs")
 		}
+		var hasRounds bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM job_rounds WHERE job_id = $1)`, id).Scan(&hasRounds); err != nil {
+			return err
+		}
+		if !hasRounds {
+			return httpx.Unprocessable("rounds_required", "define at least one selection round before submitting this job for approval")
+		}
 		in := Input{Role: cur.Role, Type: cur.Type, Location: cur.Location, CTC: cur.CTC, MinCGPA: cur.MinCGPA,
 			Branches: cur.Branches, Skills: cur.Skills, Deadline: cur.Deadline, Openings: cur.Openings,
 			Description: cur.Description, AllowBacklogs: cur.AllowBacklogs}

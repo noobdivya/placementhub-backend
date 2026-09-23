@@ -82,6 +82,19 @@ func (w *world) placementStatus(s *testutil.User) string {
 	return r.JSON()["placement"].(map[string]any)["status"].(string)
 }
 
+// defineRound gives a Draft job the one round Submit now requires. Real
+// callers use PUT /company/jobs/{id}/rounds, so tests do too rather than
+// inserting the row directly.
+func (w *world) defineRound(jobID string) {
+	w.e.T.Helper()
+	r := w.e.Req(w.company, "PUT", "/company/jobs/"+jobID+"/rounds", map[string]any{
+		"items": []map[string]any{{"name": "Technical Interview", "mode": "Online", "durationMinutes": 45}},
+	})
+	if r.Status != http.StatusOK {
+		w.e.T.Fatalf("define round: %d %s", r.Status, r.Body)
+	}
+}
+
 func (w *world) stageOf(s *testutil.User, appID string) string {
 	w.e.T.Helper()
 	for _, a := range w.e.Get(s, "/me/applications").Items() {

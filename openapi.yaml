@@ -117,10 +117,14 @@ paths:
       summary: 'Apply. 403 already_placed; 422 cgpa_too_low / branch_not_eligible / backlogs_not_allowed / resume_required / job_closed / deadline_passed; 409 already_applied.'
       parameters: [{$ref: "#/components/parameters/id"}]
       responses: {"201": {description: Application, content: {application/json: {schema: {$ref: "#/components/schemas/Application"}}}}, "403": {$ref: "#/components/responses/Error"}, "409": {$ref: "#/components/responses/Error"}, "422": {$ref: "#/components/responses/Error"}}
+  /jobs/{id}/rounds:
+    get: {tags: [Jobs], summary: "The job's ordered selection rounds, visible before applying", parameters: [{$ref: "#/components/parameters/id"}], responses: {"200": {description: Items of SelectionRound}}}
   /me/applications:
     get: {tags: [Applications], summary: "Every application ever made, including Withdrawn and Rejected", responses: {"200": {description: Items}}}
   /me/applications/{id}/withdraw:
     post: {tags: [Applications], summary: "Withdraw a live application (use decline for an offered one)", parameters: [{$ref: "#/components/parameters/id"}], responses: {"200": {description: Application}}}
+  /me/applications/{id}/rounds:
+    get: {tags: [Applications], summary: "This application's round-by-round progress", parameters: [{$ref: "#/components/parameters/id"}], responses: {"200": {description: Items of RoundProgress}}}
   /me/offers:
     get: {tags: [Applications], summary: "The student's offers", responses: {"200": {description: Items}}}
   /me/offers/{id}/accept:
@@ -197,6 +201,14 @@ paths:
     post: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "Send for approval (422 company_not_approved until the company is approved)", responses: {"200": {description: Job}}}
   /company/jobs/{id}/close:
     post: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "Stop taking applications", responses: {"200": {description: Job}}}
+  /company/jobs/{id}/rounds:
+    get: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "Own job's rounds, with `locked` per round", responses: {"200": {description: Items of SelectionRound}}}
+    put:
+      tags: [Company]
+      summary: 'Replace the ordered round list: add/remove/reorder/edit in one call. 409 rounds_locked if a round with a candidate already in progress would be removed, renamed, or reordered relative to another locked round (its schedule/logistics may still change).'
+      parameters: [{$ref: "#/components/parameters/id"}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [items], properties: {items: {type: array, items: {$ref: "#/components/schemas/RoundInput"}}}}}}}
+      responses: {"200": {description: Items of SelectionRound}, "409": {$ref: "#/components/responses/Error"}, "422": {$ref: "#/components/responses/Error"}}
   /company/candidates:
     get:
       tags: [Company]
@@ -219,6 +231,17 @@ paths:
       responses: {"200": {description: Candidate}, "409": {$ref: "#/components/responses/Error"}, "422": {$ref: "#/components/responses/Error"}}
   /company/applications/{id}/resume:
     get: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "Download an own applicant's resume", responses: {"200": {description: PDF}}}
+  /company/applications/{id}/rounds:
+    get: {tags: [Company], parameters: [{$ref: "#/components/parameters/id"}], summary: "One candidate's round-by-round progress", responses: {"200": {description: Items of RoundProgress}}}
+  /company/applications/{id}/rounds/{roundId}:
+    patch:
+      tags: [Company]
+      summary: "Set a round's status for one candidate. 409 application_withdrawn / offer_accepted; 422 invalid_transition."
+      parameters:
+        - {$ref: "#/components/parameters/id"}
+        - {name: roundId, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody: {required: true, content: {application/json: {schema: {type: object, required: [status], properties: {status: {type: string, enum: [Upcoming, Scheduled, Cleared, Rejected]}, note: {type: string}}}}}}
+      responses: {"200": {description: RoundProgress}, "409": {$ref: "#/components/responses/Error"}, "422": {$ref: "#/components/responses/Error"}}
 
   # ---- admin -----------------------------------------------------------------
   /admin/students:
@@ -430,6 +453,37 @@ components:
         stage: {type: string, enum: [Applied, Shortlisted, Interview, Offered, Rejected, Withdrawn]}
         note: {type: string}
         offer: {type: object, nullable: true, properties: {id: {type: string}, status: {type: string, enum: [Pending, Accepted, Declined, Expired, Rescinded]}, ctc: {type: number}, validUntil: {type: string, format: date-time}}}
+    SelectionRound:
+      type: object
+      properties:
+        id: {type: string}
+        seq: {type: integer}
+        name: {type: string}
+        mode: {type: string, enum: [Online, Offline]}
+        scheduledAt: {type: string, format: date-time, nullable: true}
+        durationMinutes: {type: integer}
+        location: {type: string}
+        instructions: {type: string}
+        locked: {type: boolean}
+    RoundInput:
+      type: object
+      required: [name, mode, durationMinutes]
+      properties:
+        id: {type: string, nullable: true}
+        name: {type: string}
+        mode: {type: string, enum: [Online, Offline]}
+        scheduledAt: {type: string, format: date-time, nullable: true}
+        durationMinutes: {type: integer}
+        location: {type: string}
+        instructions: {type: string}
+    RoundProgress:
+      allOf:
+        - $ref: "#/components/schemas/SelectionRound"
+        - type: object
+          properties:
+            status: {type: string, enum: [Upcoming, Scheduled, Cleared, Rejected]}
+            note: {type: string}
+            current: {type: boolean}
     AcceptResult:
       type: object
       properties:
